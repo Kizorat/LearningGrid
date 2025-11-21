@@ -214,3 +214,5 @@ __marimo__/
 # Minigrid Folder 
 Minigrid/*
 
+# Vscode Folder
+.vscode/*

@@ -53,6 +53,7 @@ def train_npc(task_name, episodes=300, batch_size=64,
 
         while not done:
             step += 1
+            agent.replay()
 
             # Scelta dell'azione valida
             valid_actions = env.get_valid_actions()

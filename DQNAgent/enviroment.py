@@ -83,15 +83,23 @@ class DynamicMiniGridWrapper:
         done = terminated or truncated
         info = info or {}
 
+        front = self._get_front_cell_type()
+
+
         # 1)Calcolo della distanza al goal
+        # Shaping: reward for reducing Manhattan distance to goal (small), small time penalty
         dist_to_goal = self._compute_distance_to_goal()
         if dist_to_goal is not None and self.prev_dist_to_goal is not None:
             delta = self.prev_dist_to_goal - dist_to_goal
-            reward += 0.1 * delta 
+            reward += 0.2 * delta  # encourage getting closer
         self.prev_dist_to_goal = dist_to_goal
 
+        reward -= 0.01  # small per-step time penalty to encourage efficiency
 
+        if action == [0,1]:
+            reward -= 0.2
 
+        # Crossing task: heavy penalty for stepping on lava
         if self.task_type == "Crossing":
             agent_pos = self.base_env.agent_pos
             grid = self.base_env.grid
@@ -101,28 +109,67 @@ class DynamicMiniGridWrapper:
                 done = True
                 info["lava_penalty"] = True
 
+        # Safer DoorKey shaping: smaller magnitudes, one-shot rewards, and guards to avoid repeated large bonuses
+        # Use attributes with getattr so this patch doesn't require edits to __init__/reset elsewhere.
+        if self.task_type == "DoorKey" and not done:
+            carrying = getattr(self.base_env, "carrying", None)
+            carry_type = getattr(carrying, "type", None) if carrying is not None else None
 
+            # one-shot bookkeeping flags
+            picked_flag = getattr(self, "_key_picked_rewarded", False)
+            door_unlocked_flag = getattr(self, "_door_unlocked_rewarded", False)
 
+            if action == self.PICKUP:
+                # pickup a key in front when not carrying => modest positive reward (only once)
+                if front == "key" and carrying is None and not picked_flag:
+                    reward += 5.0
+                    info["key_picked"] = True
+                    self._key_picked_rewarded = True
 
-        if self.task_type == "DoorKey":
-            front = self._get_front_cell_type()
-            if action == self.DROP:
-                reward -= 5.0
-                info["dropped_key_penalty"] = True
-            elif action == self.TOGGLE:
-                if front == "door" and not self.door_open:
-                    reward += 20.0
-                    self.door_open = True
-                    info["door_opened"] = True
-                elif front == "door" and self.door_open:
-                    reward -= 2.0
-                    info["toggle_redundant"] = True
+            elif action == self.DROP:
+                # discourage pointless drops but keep penalty small
+                if carrying is None:
+                    reward -= 1.0
+                    info["drop_fail"] = True
                 else:
-                    reward -= 3.0
-                    info["toggle_miss"] = True
-            elif action == self.PICKUP and front == "key":
-                reward += 5.0
-                info["key_picked"] = True
+                    reward -= 0.5
+                    info["dropped_key"] = True
+                    try:
+                        self.base_env.carrying = None
+                    except Exception:
+                        pass
+                    # if they drop the key after having picked it, allow future pickup reward again
+                    self._key_picked_rewarded = False
+
+            elif action == self.TOGGLE:
+                if front == "door":
+                    if not self.door_open:
+                        if carry_type == "key" and not door_unlocked_flag:
+                            # correct sequence: picked key -> toggle door => moderate reward (one-shot)
+                            reward += 15.0
+                            self.door_open = True
+                            info["door_unlocked_with_key"] = True
+                            self._door_unlocked_rewarded = True
+                            # consume the key if env exposes carrying
+                            try:
+                                self.base_env.carrying = None
+                            except Exception:
+                                pass
+                    else:
+                        # trying to open without key or already rewarded is penalized mildly
+                        reward -= 2.5
+                        info["toggle_without_key"] = True
+                else:
+                    # redundant toggle on an already open door
+                    reward -= 1.0
+                    info["toggle_redundant"] = True
+            else:
+                # toggle where there is no door
+                reward -= 1.5
+                info["toggle_miss"] = True
+
+        # Clip reward to avoid extreme values
+        reward = float(np.clip(reward, -100.0, 100.0))
 
         return self.get_state(), float(reward), bool(done), info
 

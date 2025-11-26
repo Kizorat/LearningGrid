@@ -9,7 +9,7 @@ from collections import deque, namedtuple
 Transition = namedtuple('Transition', ('state','action','reward','next_state','done'))
 
 class ReplayBuffer:
-    def __init__(self, capacity=20000):
+    def __init__(self, capacity=50000):
         self.buffer = deque(maxlen=capacity)
 
     def push(self, *args):

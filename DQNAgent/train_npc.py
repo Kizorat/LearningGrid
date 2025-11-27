@@ -105,23 +105,60 @@ if __name__ == "__main__":
     parser.add_argument("--csv", action="store_true")
     args = parser.parse_args()
 
-    tasks = [
-        "MiniGrid-Empty-5x5-v0",
-        "MiniGrid-DoorKey-5x5-v0",
-        "MiniGrid-LavaCrossingS9N1-v0"
-    ]
+    env_options = {
+    "1": {
+        "label": "Crossing",
+        "ids": [
+            "MiniGrid-LavaCrossingS9N1-v0",
+            "MiniGrid-LavaCrossingS9N3-v0",
+            "MiniGrid-LavaCrossingS11N5-v0",
+        ],
+    },
+    "2": {
+        "label": "DoorKey",
+        "ids": [
+            "MiniGrid-DoorKey-5x5-v0",
+            "MiniGrid-DoorKey-8x8-v0",
+            "MiniGrid-DoorKey-16x16-v0",
+        ],
+    },
+    "3": {
+        "label": "Empty",
+        "ids": [
+            "MiniGrid-Empty-5x5-v0",
+            "MiniGrid-Empty-8x8-v0",
+            "MiniGrid-Empty-16x16-v0",
+        ],
+    },
+}
 
-    for task in tasks:
-        print(f"\n===== Training task: {task} =====")
+    # Scelta dell'ambiente
+    while True:
+        choice = input("Scegli l'ambiente (1=Crossing, 2=DoorKey, 3=Empty): ").strip()
+        if choice in env_options:
+            break
+        print("Scelta non valida, inserisci 1, 2 o 3.")
 
-        csv_path = f"{task.replace(':','_')}_log.csv" if args.csv else None
+        # Scelta della dimensione
+    while True:
+        size = input("Scegli la dimensione della mappa (1=piccolo, 2=medio, 3=grande): ").strip()
+        if size in ("1", "2", "3"):
+            break
+        print("Scelta non valida, inserisci 1, 2 o 3.")
 
-        train_npc(
-            task,
-            episodes=args.episodes,
-            batch_size=args.batch_size,
-            replay_every=args.replay_every,
-            turbo=args.turbo,
-            render=args.render,
-            csv_out=csv_path
-        )
+    env_id = env_options[choice]["ids"][int(size) - 1]
+    print(f"Ambiente selezionato: {env_options[choice]['label']} -> {env_id}")
+
+
+
+    csv_path = f"{env_id.replace(':','_')}_log.csv" if args.csv else None
+
+    train_npc(
+        env_id,
+        episodes=args.episodes,
+        batch_size=args.batch_size,
+        replay_every=args.replay_every,
+        turbo=args.turbo,
+        render=args.render,
+        csv_out=csv_path
+    )

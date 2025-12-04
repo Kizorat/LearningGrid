@@ -1,119 +1,129 @@
-# agent.py
-import random
+# agent_pro.py
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from collections import deque, namedtuple
+from collections import deque
+import random
 
-Transition = namedtuple('Transition', ('state','action','reward','next_state','done'))
-
-class ReplayBuffer:
-    def __init__(self, capacity=50000):
-        self.buffer = deque(maxlen=capacity)
-
-    def push(self, *args):
-        self.buffer.append(Transition(*args))
-
-    def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
-        return Transition(*zip(*batch))
-
-    def __len__(self):
-        return len(self.buffer)
-
-class QNetwork(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, output_dim)
-        )
-
+# ------------------ MODELLO DQN ------------------
+class DQN(nn.Module):
+    def __init__(self, state_size, action_size):
+        super(DQN, self).__init__()
+        self.fc1 = nn.Linear(state_size, 128)
+        self.fc2 = nn.Linear(128, 128)
+        self.fc3 = nn.Linear(128, action_size)
+    
     def forward(self, x):
-        return self.net(x)
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return self.fc3(x)
 
+# ------------------ AGENTE DQN ------------------
 class DQNAgent:
-    def __init__(self, state_size, action_size, device=None,
-                 lr=1e-3, gamma=0.99, epsilon_start=1.0, epsilon_min=0.01, epsilon_decay=0.995,
-                 target_update=10):
-        self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+    def __init__(self, state_size, action_size, device=None, replay_buffer_size=10000, batch_size=64):
         self.state_size = state_size
         self.action_size = action_size
-        self.gamma = gamma
-        self.epsilon = epsilon_start
-        self.epsilon_min = epsilon_min
-        self.epsilon_decay = epsilon_decay
+        self.replay_buffer = deque(maxlen=replay_buffer_size)
+        self.batch_size = batch_size
 
-        self.policy_net = QNetwork(state_size, action_size).to(self.device)
-        self.target_net = QNetwork(state_size, action_size).to(self.device)
-        self.target_net.load_state_dict(self.policy_net.state_dict())
-        self.target_net.eval()
+        # Hyperparameters
+        self.gamma = 0.95
+        self.epsilon = 1.0
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.995
+        self.learning_rate = 0.001
 
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
-        self.replay_buffer = ReplayBuffer()
-        self.batch_size = 64
-        self.target_update = target_update
-        self.steps_done = 0
+        # Device
+        self.device = torch.device(device) if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"🖥️  DQNAgent running on {self.device}")
 
-    def act(self, state_np, valid_actions):
-        if random.random() < self.epsilon:
-            return random.choice(valid_actions)
-        state = torch.from_numpy(state_np).float().to(self.device)
+        # Models
+        self.model = DQN(state_size, action_size).to(self.device)
+        self.target_model = DQN(state_size, action_size).to(self.device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        self.criterion = nn.MSELoss()
+
+        # Initialize target model
+        self.update_target_model()
+
+    # ------------------ FUNZIONI BASE ------------------
+    def update_target_model(self):
+        self.target_model.load_state_dict(self.model.state_dict())
+
+    def remember(self, state, action, reward, next_state, done,valid_mask, next_valid_mask):
+        # Flatten stati se multidimensionali
+        state = state.flatten() if len(state.shape) > 1 else state
+        next_state = next_state.flatten() if len(next_state.shape) > 1 else next_state
+        self.replay_buffer.append((state, action, reward, next_state, done))
+
+    def act(self, state, valid_actions=None):
+        state = state.flatten() if len(state.shape) > 1 else state
+
+        # Epsilon-greedy
+        if np.random.rand() <= self.epsilon:
+            if valid_actions is not None:
+                return np.random.choice(valid_actions)
+            return random.randrange(self.action_size)
+
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            q = self.policy_net(state).cpu().numpy()[0]
-        masked = np.full_like(q, -np.inf)
-        masked[valid_actions] = q[valid_actions]
-        return int(masked.argmax())
+            q_values = self.model(state_tensor).cpu().numpy()[0]
 
-    def remember(self, state, action, reward, next_state, done):
-        self.replay_buffer.push(state.astype(np.float32), action, reward, next_state.astype(np.float32), done)
+        # Maschera azioni non valide
+        if valid_actions is not None:
+            masked = np.full(self.action_size, -np.inf)
+            masked[valid_actions] = q_values[valid_actions]
+            return np.argmax(masked)
+        return np.argmax(q_values)
 
     def replay(self, n_steps=1):
         if len(self.replay_buffer) < self.batch_size:
             return
+
         for _ in range(n_steps):
-            transitions = self.replay_buffer.sample(self.batch_size)
-            states = torch.from_numpy(np.vstack(transitions.state)).float().to(self.device)
-            actions = torch.tensor(transitions.action, dtype=torch.long, device=self.device).unsqueeze(1)
-            rewards = torch.tensor(transitions.reward, dtype=torch.float32, device=self.device).unsqueeze(1)
-            next_states = torch.from_numpy(np.vstack(transitions.next_state)).float().to(self.device)
-            dones = torch.tensor(transitions.done, dtype=torch.float32, device=self.device).unsqueeze(1)
+            minibatch = random.sample(self.replay_buffer, self.batch_size)
 
+            states = torch.FloatTensor(np.array([x[0] for x in minibatch])).to(self.device)
+            actions = torch.LongTensor([x[1] for x in minibatch]).to(self.device)
+            rewards = torch.FloatTensor([x[2] for x in minibatch]).to(self.device)
+            next_states = torch.FloatTensor(np.array([x[3] for x in minibatch])).to(self.device)
+            dones = torch.FloatTensor([x[4] for x in minibatch]).to(self.device)
 
-            q_values = self.policy_net(states).gather(1, actions)
+            # Q-values correnti
+            current_q = self.model(states).gather(1, actions.unsqueeze(1)).squeeze(1)
 
-
+            # Q-values target
             with torch.no_grad():
-                q_next_all = self.target_net(next_states)
-                q_next_max, _ = q_next_all.max(dim=1, keepdim=True)
+                next_q = self.target_model(next_states).max(1)[0]
+                target_q = rewards + (1 - dones) * self.gamma * next_q
 
-            q_target = rewards + (1.0 - dones) * (self.gamma * q_next_max)
-
-            loss = nn.functional.mse_loss(q_values, q_target)
-
+            # Loss e backprop
+            loss = self.criterion(current_q, target_q)
             self.optimizer.zero_grad()
             loss.backward()
-            # gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 10.0)
             self.optimizer.step()
 
-            self.steps_done += 1
-
-        # soft/periodic update target network
-        if self.steps_done % self.target_update == 0:
-            self.target_net.load_state_dict(self.policy_net.state_dict())
-
-        # epsilon decay
+        # Decay epsilon
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
 
-    def save(self, path):
-        torch.save(self.policy_net.state_dict(), path)
+    # ------------------ SALVATAGGIO / CARICAMENTO ------------------
+    def save(self, filename):
+        checkpoint = {
+            'model_state_dict': self.model.state_dict(),
+            'target_model_state_dict': self.target_model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'epsilon': self.epsilon
+        }
+        torch.save(checkpoint, filename)
+        print(f"✓ Modello salvato: {filename}")
 
-    def load(self, path):
-        self.policy_net.load_state_dict(torch.load(path, map_location=self.device))
-        self.target_net.load_state_dict(self.policy_net.state_dict())
+    def load(self, filename):
+        checkpoint = torch.load(filename, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.target_model.load_state_dict(checkpoint['target_model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.epsilon = checkpoint['epsilon']
+        print(f"✓ Modello caricato: {filename}")

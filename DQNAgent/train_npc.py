@@ -1,7 +1,7 @@
 # train_npc.py
 import argparse
 import gymnasium as gym
-from minigrid.wrappers import ImgObsWrapper
+from minigrid.wrappers import FullyObsWrapper
 from enviroment import DynamicMiniGridWrapper
 from agent import DQNAgent
 import csv
@@ -18,7 +18,7 @@ def detect_task_type(env_id):
 
 def make_env(env_id, render=False):
     env = gym.make(env_id, render_mode=("human" if render else None))
-    env = ImgObsWrapper(env)     
+    env = FullyObsWrapper(env)  # <-- CORRETTO: era ImgObsWrapper
     return env
 
 
@@ -57,14 +57,19 @@ def train_npc(task_name, episodes=300, batch_size=64,
 
             # Scelta dell'azione valida
             valid_actions = env.get_valid_actions()
+
+            valid_mask = [1 if a in valid_actions else 0 for a in range(env.action_size)]
             action = agent.act(state, valid_actions)
 
             # step env
             next_state, reward, done, info = env.step(action)
             total_reward += reward
 
+            next_valid_actions=env.get_valid_actions()
+            next_valid_mask = [1 if a in next_valid_actions else 0 for a in range(env.action_size)]
 
-            agent.remember(state, action, reward, next_state, done)
+
+            agent.remember(state, action, reward, next_state, done, valid_mask,next_valid_mask)
             state = next_state
 
 

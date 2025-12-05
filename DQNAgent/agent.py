@@ -22,7 +22,7 @@ class DQN(nn.Module):
 
 # ------------------ AGENTE DQN ------------------
 class DQNAgent:
-    def __init__(self, state_size, action_size, device=None, replay_buffer_size=10000, batch_size=64):
+    def __init__(self, state_size, action_size, device=None, replay_buffer_size=30000, batch_size=64):
         self.state_size = state_size
         self.action_size = action_size
         self.replay_buffer = deque(maxlen=replay_buffer_size)
@@ -32,7 +32,7 @@ class DQNAgent:
         self.gamma = 0.95
         self.epsilon = 1.0
         self.epsilon_min = 0.01
-        self.epsilon_decay = 0.995
+        self.epsilon_decay = 0.9995
         self.learning_rate = 0.001
 
         # Device

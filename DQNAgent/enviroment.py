@@ -1,7 +1,8 @@
 import numpy as np
 
 class DynamicMiniGridWrapper:
-    BASIC_ACTIONS = [0, 1, 2]  # left, right, forward
+    BASIC_ACTIONS = [0, 1]  # left, right, forward
+    FORWARD = 2
     PICKUP = 3
     DROP = 4
     TOGGLE = 5
@@ -22,12 +23,15 @@ class DynamicMiniGridWrapper:
         self.action_size = 7
         self.state_size = len(self.state)
 
+        self.best_dist_to_goal = float('inf')
+
         # Controllo anti-spinning
         self.spin_count = 0
         self.last_was_rotation = False
 
         # DoorKey
         self.door_open = False
+        self._door_unlocked_rewarded = False
 
         # Per reward shaping
         self.prev_dist_to_goal = self._compute_distance_to_goal()
@@ -71,7 +75,7 @@ class DynamicMiniGridWrapper:
     def get_valid_actions(self):
         valid = self.BASIC_ACTIONS.copy()
         front = self._get_front_cell_type()
-
+        valid.append(self.FORWARD)
         if self.task_type == "DoorKey":
             if front == "key":
                 valid.append(self.PICKUP)
@@ -86,6 +90,8 @@ class DynamicMiniGridWrapper:
             print(f"DEBUG: goal_pos impostato a {self.base_env.goal_pos}")
         self.state = self._obs_to_state(self.obs)
         self.door_open = False
+        self._door_unlocked_rewarded = False
+        self.best_dist_to_goal = float('inf')
         self.prev_dist_to_goal = self._compute_distance_to_goal()
         self.prev_agent_pos = getattr(self.base_env, "agent_pos", None)
         return self.get_state()
@@ -104,7 +110,7 @@ class DynamicMiniGridWrapper:
             """
             from heapq import heappush, heappop
 
-            DIR2VEC = {0:(1,0), 1:(0,1), 2:(-1,0), 3:(0,-1)}
+            DIR2VEC = {0:(1,0), 1:(0,1), 2:(-1,0), 3:(0,-1)} # 0=east,1=south,2=west,3=north
             start = tuple(self.base_env.agent_pos)
             goal = self.base_env.goal_pos
             grid = self.base_env.grid
@@ -160,83 +166,82 @@ class DynamicMiniGridWrapper:
 
 
     def step(self, action):
+        # Controllo azione valida
         valid = self.get_valid_actions()
         if action not in valid:
-            return self.get_state(), -0.2, False, {"invalid_action": True}
+            return self.get_state(), -1.0, False, {"invalid_action": True}
 
-        prev_pos = getattr(self.base_env, "agent_pos", None)
-
+        # Esegui l'azione nell'environment
         obs, reward, terminated, truncated, info = self.env.step(action)
         self.obs = obs
         self.state = self._obs_to_state(obs)
         done = terminated or truncated
         info = info or {}
 
-        current_pos = getattr(self.base_env, "agent_pos", None)
+        # Controllo frontale e oggetto trasportato
         front_type = self._get_front_cell_type()
         carrying = getattr(self.base_env, "carrying", None)
 
-        # Penalità muro
-        if action == 2 and front_type == "wall":
-            reward -= 0.2
-            info["bumped_wall"] = True
+        # Incentivare a muoversi in avanti
+        if action == 2 and front_type not in ["wall", "door", "lava", "key"]:
+            reward += 0.01
 
-        # Penalità forward se non si muove
-        if action == 2 and prev_pos is not None and current_pos is not None:
-            if np.array_equal(prev_pos, current_pos):
-                reward -= 0.2
-                info["no_move_penalty"] = True
 
-        # Reward shaping distanza al goal
+        # Debug
+        #print("DEBUG STEP")
+        #print("Azione eseguita:", action)
+        #print("Agente davanti a:", front_type)
+        #print("Carrying:", carrying)
+
+        # Reward shaping: distanza al goal
         dist_to_goal = self._compute_distance_to_goal()
-        if dist_to_goal is not None and self.prev_dist_to_goal is not None:
-            delta = self.prev_dist_to_goal - dist_to_goal
-            reward += 0.2 * delta
-        self.prev_dist_to_goal = dist_to_goal
+        # Premia SOLO se ottieni una distanza migliore della migliore mai raggiunta
+        if dist_to_goal is not None and dist_to_goal < self.best_dist_to_goal:
+            # aggiorna il record
+            self.best_dist_to_goal = dist_to_goal
 
-        # Penalità per step
+            # shaping: più ti avvicini la prima volta, più reward
+            improvement = self.best_dist_to_goal - dist_to_goal
+            reward += 0.02 * improvement
+
+
+        # Reward goal +1 solo se episodio terminato con successo
+        if terminated:
+            print("Goal raggiunto!")
+            reward += 1.0
+            info["goal_reached"] = True
+
+        # Piccola penalità per step
         reward -= 0.01
-
-        # Anti-spinning
-        if action in [0, 1]:
+        # Anti-spinning: penalità per rotazioni eccessive
+        if action == 0 and action == 1:  # 0=left, 1=right
             if self.last_was_rotation:
                 self.spin_count += 1
             else:
                 self.spin_count = 1
                 self.last_was_rotation = True
 
-            if self.spin_count > 3:
-                penalty = min(0.07 * self.spin_count, 0.5)
+            # penalità crescente dopo la terza rotazione consecutiva
+            if self.spin_count > 2:
+                penalty = min(0.01 * self.spin_count, 0.05)
                 reward -= penalty
                 info["spin_penalty"] = penalty
+
         else:
+            # reset se l’agente fa avanti o altro
             self.spin_count = 0
             self.last_was_rotation = False
 
-        # Crossing task: lava e goal
+
+        # Crossing task: lava
         if self.task_type == "Crossing":
-            goal_pos = getattr(self.base_env, "goal_pos", None)
-            if current_pos is not None:
-                grid = self.base_env.grid
-                cell = grid.get(*current_pos)
-
-                # Lava sotto l'agente
-                if cell and cell.type == "lava":
-                    reward -= 11
-                    done = True
-                    info["lava_penalty"] = True
-
-                # Lava davanti all'agente se va forward
-                if front_type == "lava" and action == 2:
-                    reward -= 5
-                    info["approaching_lava"] = True
-
-                # Goal raggiunto solo se l’agente è nella cella goal e non è lava
-                if goal_pos is not None and tuple(current_pos) == goal_pos:
-                    print("Goal raggiunto!")
-                    reward += 1.0
-                    done = True
-                    info["goal_reached"] = True
+            agent_pos = self.base_env.agent_pos
+            grid = self.base_env.grid
+            cell = grid.get(*agent_pos)
+            if cell and cell.type == "lava":
+                reward -= 11
+                done = True
+                info["lava_penalty"] = True
 
         # DoorKey task
         if self.task_type == "DoorKey" and not done:
@@ -244,22 +249,25 @@ class DynamicMiniGridWrapper:
             picked_flag = getattr(self, "_key_picked_rewarded", False)
             door_unlocked_flag = getattr(self, "_door_unlocked_rewarded", False)
 
+            # PICKUP solo frontale se non trasporta nulla
             if action == self.PICKUP:
-                if front_type == "key" and carrying is None:
+                if front_type == "key" or carry_type == "key":
                     print("Raccolgo la chiave!")
-                    reward += 0.5 if not picked_flag else 0.0
+                    reward += 1
                     info["key_picked"] = True
                     self._key_picked_rewarded = True
                 else:
-                    reward -= 0.1
+                    print("Pickup fallito")
+                    reward -= 0.01
                     info["pickup_fail"] = True
 
+            # DROP
             elif action == self.DROP:
                 if carrying is None:
-                    reward -= 0.1
+                    reward -= 0.01
                     info["drop_fail"] = True
                 else:
-                    reward -= 0.05
+                    reward -= 0.01
                     info["dropped_key"] = True
                     try:
                         self.base_env.carrying = None
@@ -267,12 +275,13 @@ class DynamicMiniGridWrapper:
                         pass
                     self._key_picked_rewarded = False
 
+            # TOGGLE porta
             elif action == self.TOGGLE:
                 if front_type == "door":
                     if not self.door_open:
                         if carry_type == "key" and not door_unlocked_flag:
                             print("Apro la porta!")
-                            reward += 0.5
+                            reward += 1
                             info["door_unlocked_with_key"] = True
                             self._door_unlocked_rewarded = True
                             self.door_open = True
@@ -281,18 +290,20 @@ class DynamicMiniGridWrapper:
                             except Exception:
                                 pass
                         else:
-                            reward -= 0.2
+                            print("Porta bloccata, mi serve una chiave!")
+                            reward -= 0.01
                             info["toggle_without_key"] = True
                     else:
+                        print("Chiudo la porta!")
                         reward -= 0.1
                         info["toggle_redundant"] = True
                 else:
-                    reward -= 0.15
+                    print("Non c'è nessuna porta da aprire/chiudere davanti a me!")
+                    reward -= 0.01
                     info["toggle_miss"] = True
 
         # Clip reward
         reward = float(np.clip(reward, -100.0, 100.0))
-        self.prev_agent_pos = current_pos
 
         return self.get_state(), float(reward), bool(done), info
 

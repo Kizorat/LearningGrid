@@ -8,11 +8,12 @@ Versione ottimizzata:
 
 import argparse
 import time
+import json
 import heapq
 import numpy as np
 import torch
 import re
-from transformers import AutoTokenizer, AutoModelForCausalLM
+import ollama
 import gymnasium as gym
 from minigrid.wrappers import FullyObsWrapper
 from DQNAgent.agent import DQNAgent
@@ -63,41 +64,110 @@ def simulate_actions(agent_pos, agent_dir, actions, grid):
     return True
 
 # ---------------- A* pathfinder (grid cells only) ----------------
+import heapq
+
+import heapq
+
 def astar_path(grid, start, goal):
-    """Restituisce una lista di pos (x,y) dal start al goal (incluso),
-    o [] se non esiste path. Considera come bloccanti wall/lava."""
+    """
+    Trova la prima cella libera verso il goal muovendosi SOLO in orizzontale
+    o verticale. Da quella cella parte A*.
+    Il path restituito inizia sempre dallo start.
+    """
+
     W, H = grid.width, grid.height
-    def passable(x,y):
-        if not (0<=x<W and 0<=y<H): return False
-        c = grid.get(x,y)
-        return (c is None) or (getattr(c,"type",None) not in ["wall","lava"])
+
+    def passable(x, y):
+        if not (0 <= x < W and 0 <= y < H):
+            return False
+        c = grid.get(x, y)
+        return (c is None) or (getattr(c, "type", None) not in ["wall", "lava"])
+
     sx, sy = start
     gx, gy = goal
+
+    # ------------------------------------------------------------
+    # 1. Scegliamo l’asse su cui muoverci
+    # ------------------------------------------------------------
+    dx = 0
+    dy = 0
+
+    if abs(gx - sx) >= abs(gy - sy):
+        # Muoviamoci lungo X
+        dx = 1 if gx > sx else -1
+        dy = 0
+    else:
+        # Muoviamoci lungo Y
+        dx = 0
+        dy = 1 if gy > sy else -1
+
+    # ------------------------------------------------------------
+    # 2. Cerca la prima cella libera lungo l’asse scelto
+    # ------------------------------------------------------------
+    cur_x, cur_y = sx, sy
+    first_free = None
+
+    while True:
+        cur_x += dx
+        cur_y += dy
+
+        # fuori mappa → niente path valido
+        if not (0 <= cur_x < W and 0 <= cur_y < H):
+            return []
+
+        if passable(cur_x, cur_y):
+            first_free = (cur_x, cur_y)
+            break
+
+    if first_free is None:
+        return []
+
+    # ------------------------------------------------------------
+    # 3. A* parte da first_free
+    # ------------------------------------------------------------
+    new_start = first_free
+
     open_heap = []
-    heapq.heappush(open_heap, (0, sx, sy))
-    came_from = {(sx,sy): None}
-    gscore = { (sx,sy): 0 }
-    def h(a,b): return abs(a[0]-b[0]) + abs(a[1]-b[1])
+    heapq.heappush(open_heap, (0, new_start[0], new_start[1]))
+    came_from = {new_start: None}
+    gscore = {new_start: 0}
+
+    def h(a, b):
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+    # ------------------------------------------------------------
+    # 4. A*
+    # ------------------------------------------------------------
     while open_heap:
         _, x, y = heapq.heappop(open_heap)
-        if (x,y) == (gx,gy):
-            # ricostruisci path
+
+        if (x, y) == (gx, gy):
+            # Ricostruzione
             path = []
-            cur = (x,y)
+            cur = (x, y)
             while cur is not None:
                 path.append(cur)
                 cur = came_from[cur]
-            return list(reversed(path))
-        for dx,dy in [(1,0),(-1,0),(0,1),(0,-1)]:
-            nx, ny = x+dx, y+dy
-            if not passable(nx,ny): continue
-            tentative = gscore[(x,y)] + 1
-            if (nx,ny) not in gscore or tentative < gscore[(nx,ny)]:
-                gscore[(nx,ny)] = tentative
-                priority = tentative + h((nx,ny),(gx,gy))
+            path.reverse()
+
+            # Prepend start
+            return [start] + path
+
+        for mx, my in [(1,0), (-1,0), (0,1), (0,-1)]:
+            nx, ny = x + mx, y + my
+            if not passable(nx, ny):
+                continue
+
+            tentative = gscore[(x, y)] + 1
+            if (nx, ny) not in gscore or tentative < gscore[(nx, ny)]:
+                gscore[(nx, ny)] = tentative
+                priority = tentative + h((nx, ny), (gx, gy))
                 heapq.heappush(open_heap, (priority, nx, ny))
-                came_from[(nx,ny)] = (x,y)
+                came_from[(nx, ny)] = (x, y)
+
     return []
+
+
 
 # ---------------- conversione path->azioni con rotazioni corrette ----------------
 def rotate_to(curr_dir, desired_dir):
@@ -114,6 +184,16 @@ def rotate_to(curr_dir, desired_dir):
     if diff == 3:
         return ["left"]
     return []
+
+def front_cell(grid, pos, direction):
+    DIR2VEC = {0: (1,0), 1:(0,1), 2:(-1,0), 3:(0,-1)}
+    dx, dy = DIR2VEC[direction]
+    fx, fy = pos[0] + dx, pos[1] + dy
+    if not (0 <= fx < grid.width and 0 <= fy < grid.height):
+        return fx, fy, "wall"
+    cell = grid.get(fx, fy)
+    ctype = "empty" if cell is None else cell.type
+    return fx, fy, ctype
 
 def pos_to_dir(from_pos, to_pos):
     dx = to_pos[0] - from_pos[0]
@@ -145,9 +225,9 @@ def path_to_actions(path, start_dir):
 # ---------------- ASCII Grid builder ----------------
 def build_ascii_grid(grid, agent_pos, goal_pos):
     rows = []
-    for y in range(grid.height):
+    for y in range(1, grid.height - 1):  # Skip top and bottom rows (walls)
         row = []
-        for x in range(grid.width):
+        for x in range(1, grid.width - 1):  # Skip left and right columns (walls)
             if (x,y) == tuple(agent_pos):
                 row.append("A")
             elif (x,y) == tuple(goal_pos):
@@ -167,105 +247,117 @@ def build_ascii_grid(grid, agent_pos, goal_pos):
 
 # ---------------- LLM Helper (ottimizzato) ----------------
 class LLMHelper:
-    def __init__(self, hf_model=HF_MODEL, device=DEVICE, verbose=False):
+    def __init__(self, model_name="mistral:7b", verbose=False):
         self.verbose = verbose
-        self.device = device
-        # caricamento HF (se disponibile)
-        try:
-            self.tokenizer = AutoTokenizer.from_pretrained(hf_model)
-            self.model = AutoModelForCausalLM.from_pretrained(hf_model)
-            if torch.cuda.is_available() and device == "cuda":
-                self.model.to("cuda")
-            else:
-                self.model.to("cpu")
-        except Exception as e:
-            print("Attenzione: non sono riuscito a caricare il modello HF. LLM non disponibile.", e)
-            self.tokenizer = None
-            self.model = None
+        self.model_name = model_name
 
-    def build_prompt(self, grid_ascii, agent_pos, agent_dir, goal_pos, mid_cell, max_actions):
+    def build_prompt(self, grid_ascii, agent_pos, agent_dir, goal_pos, mid_cell, max_actions, grid):
+        path = astar_path(grid, tuple(agent_pos), tuple(goal_pos))
+        mid_cell_str = f"Key mid cell: {mid_cell}" if mid_cell is not None else ""
+        
+        # Convert numpy types to Python int
+        agent_pos = (int(agent_pos[0]), int(agent_pos[1]))
+        agent_dir = int(agent_dir)
+        agent_dir_str = ["east", "south", "west", "north"][agent_dir]
+        goal_pos = (int(goal_pos[0]), int(goal_pos[1]))
+        path = [(int(p[0]), int(p[1])) for p in path]
+        
+        # Convert ASCII grid into structured JSON grid
+        # Assumes grid_ascii is something like:
+        # ". . .\n. A .\n. . G"
+        rows = [
+            [cell for cell in row.split()]
+            for row in grid_ascii.strip().split("\n")
+        ]
+
+        # Replace agent symbol with direction indicator
+        agent_dir_symbols = {0: ">", 1: "v", 2: "<", 3: "^"}  # 0=east, 1=south, 2=west, 3=north
+        agent_symbol = agent_dir_symbols.get(agent_dir, "A")
+        
+        for i, row in enumerate(rows):
+            for j, cell in enumerate(row):
+                if cell == "A":
+                    rows[i][j] = agent_symbol
+                    break
+
+        # Build JSON structure with single-line rows
+        grid_json = {
+            "rows": len(rows),
+            "cols": len(rows[0]) if rows else 0,
+            "grid": [" ".join(row) for row in rows]  # Join each row into a single string
+        }
+
         prompt = (
-            "You are an assistant that must propose a sequence of safe actions for an agent in a grid.\n"
-            f"Grid ASCII (A=agent, G=goal, #=wall, ~=lava, .=free):\n{grid_ascii}\n\n"
-            f"Agent position: {agent_pos}, direction: {agent_dir}\n"
+            "You are a controller that must produce the shortest valid action sequence for an agent moving in a grid (positions = columns, rows).\n"
+            "Your output must be deterministic, minimal and contain only the final list of actions.\n"
+            f"Grid ASCII JSON (A=agent, G=goal, #=wall, ~=lava, .=free):\n{json.dumps(grid_json, indent=2)}\n\n"
+            f"Agent position: {agent_pos}, direction: {agent_dir_str}\n"
             f"Goal position: {goal_pos}\n"
-            f"Key mid cell (bridge across lava): {mid_cell}\n"
-            f"Valid actions: {VALID_ACTIONS}\n"
+            f"{mid_cell_str}\n"
+            f"Valid actions: ['forward', 'left', 'right'] (left and right 90° turn the agent's direction without moving it)\n"
+            f"Path from agent to goal (cells): {path}\n"
             f"Max suggested actions: {max_actions}\n\n"
             "IMPORTANT:\n"
-            "- 'forward' = move 1 cell in current facing direction\n"
-            "- 'left' = rotate agent 90 degrees to the LEFT (no movement)\n"
-            "- 'right' = rotate agent 90 degrees to the RIGHT (no movement)\n"
-            "- You MUST output ONLY a Python list of actions using only these tokens, e.g. ['left','forward','forward']\n"
-            "- Use the minimal number of actions necessary to reach the goal; avoid walls and lava.\n"
-            "- No extra text or explanation. If you cannot find a safe move, return []\n"
+            "- Output ONLY a Python list of actions, e.g. ['left','forward','right']\n"
+            "- Do not include explanations.\n"
+            "Example grid:\n"
+            ". . .\n"
+            ". ^ .\n"
+            ". . G\n"
+            "Example output:\n"
+            "['right', 'forward', 'right', 'forward']\n"
         )
+        print(prompt)
         return prompt
 
     def suggest_actions(self, grid, agent_pos, agent_dir, goal_pos, mid_cell, max_actions=10):
-        # Se il modello non è caricato -> fallback immediato
-        if self.model is None or self.tokenizer is None:
-            return []
-
         grid_ascii = build_ascii_grid(grid, agent_pos, goal_pos)
-        prompt = self.build_prompt(grid_ascii, agent_pos, agent_dir, goal_pos, mid_cell, max_actions)
+        prompt = self.build_prompt(grid_ascii, agent_pos, agent_dir, goal_pos, mid_cell, max_actions, grid)
+
         if self.verbose:
             print("--- PROMPT ---\n", prompt)
-    
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
-        input_ids = inputs.input_ids.to(self.model.device)
-        attention_mask = inputs.attention_mask.to(self.model.device)
 
         try:
-            # uso deterministico (no sampling), pochi token
-            gen = self.model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=32,
-                do_sample=False,
-                temperature=0.0,
-                eos_token_id=self.tokenizer.eos_token_id
+            response = ollama.generate(
+                model=self.model_name,
+                prompt=prompt
             )
-            raw = self.tokenizer.decode(gen[0], skip_special_tokens=True)
+            raw = response["response"]
+            print(raw)
             if self.verbose:
                 print("--- RAW LLM RESPONSE ---\n", raw)
         except Exception as e:
-            if self.verbose:
-                print("LLM generation error:", e)
-            raw = ""
+            print("Errore Ollama:", e)
+            return []
 
-        # parsing robusto: trova prima lista python-like
+        # Parsing Python list
         m = re.search(r"\[([^\]]*)\]", raw)
-        seq = []
-        if m:
-            items = m.group(1).split(",")
-            for it in items:
-                tok = it.strip().strip("'\"")
-                if tok in VALID_ACTIONS:
-                    seq.append(tok)
-                    if len(seq) >= max_actions:
-                        break
+        if not m:
+            return []
 
-        # verifica di sicurezza: simula ogni azione e scarta quelle che portano a collisione
-        safe_seq = []
+        tokens = [t.strip().strip("'\"") for t in m.group(1).split(",")]
+        valid = ["forward", "left", "right"]
+
+        seq = [tok for tok in tokens if tok in valid][:max_actions]
+
+        # Safety check
+        safe = []
         sim_pos = tuple(agent_pos)
         sim_dir = int(agent_dir)
         for s in seq:
             if simulate_actions(sim_pos, sim_dir, [s], grid):
-                safe_seq.append(s)
-                # update sim state
+                safe.append(s)
                 if s == "forward":
                     dx,dy = DIR2VEC[sim_dir]
-                    sim_pos = (sim_pos[0]+dx, sim_pos[1]+dy)
+                    sim_pos = (sim_pos[0] + dx, sim_pos[1] + dy)
                 elif s == "left":
-                    sim_dir = (sim_dir-1)%4
+                    sim_dir = (sim_dir - 1) % 4
                 elif s == "right":
-                    sim_dir = (sim_dir+1)%4
+                    sim_dir = (sim_dir + 1) % 4
             else:
-                # interruzione se LLM ha suggerito mossa non valida
                 break
 
-        return safe_seq[:max_actions]
+        return safe
 
 # ---------------- Training Loop ----------------
 def train(env_wrapper, episodes=5, use_llm_helper=True, render_env=False,
@@ -297,22 +389,18 @@ def train(env_wrapper, episodes=5, use_llm_helper=True, render_env=False,
                 agent_dir = env_wrapper.base_env.agent_dir
                 goal_pos = env_wrapper.base_env.goal_pos
                 mid_cell,_ = find_mid_cell_and_path(env_wrapper.base_env.grid, agent_pos, goal_pos)
-                
-                # 1) tentativo deterministico: A* path + conversione in azioni
-                path = astar_path(env_wrapper.base_env.grid, tuple(agent_pos), tuple(goal_pos))
+
                 plan_actions = []
-                if path:
-                    plan_actions = path_to_actions(path, agent_dir)
-                    # taglia alle max azioni desiderate
-                    max_actions = max(1, int(max_llm_actions_factor*(abs(agent_pos[0]-goal_pos[0])+abs(agent_pos[1]-goal_pos[1]))))
-                    plan_actions = plan_actions[:max_actions]
-                
-                # 2) se A* non trova path, prova LLM (fallback)
-                suggestions = []
-                if not plan_actions and helper is not None:
-                    max_actions = max(1,int(max_llm_actions_factor*(abs(agent_pos[0]-goal_pos[0])+abs(agent_pos[1]-goal_pos[1]))))
-                    suggestions = helper.suggest_actions(env_wrapper.base_env.grid, agent_pos, agent_dir, goal_pos, mid_cell, max_actions=max_actions)
-                    plan_actions = suggestions
+
+                # 1) Chiamata principale all'LLM
+                if helper is not None:
+                    max_actions = max(1,int(max_llm_actions_factor*(abs(agent_pos[0]-goal_pos[0])+abs(agent_pos[1]-goal_pos[1])))) + 1
+                    plan_actions = helper.suggest_actions(env_wrapper.base_env.grid, agent_pos, agent_dir, goal_pos, mid_cell, max_actions=max_actions)
+
+                # 2) LLM non produce azioni valide
+                if not plan_actions:
+                    print("LLM non ha suggerito azioni valide.")
+                    ep_hall += 1
 
                 # 3) applica le azioni pianificate (o single-step fallback)
                 for s in plan_actions:
@@ -331,7 +419,10 @@ def train(env_wrapper, episodes=5, use_llm_helper=True, render_env=False,
 
                     next_state_raw, reward, done, info = env_wrapper.step(action)
                     next_state = flatten_obs(next_state_raw)
-                    agent.remember(state, action, reward, next_state, done)
+                    valid_mask = [1 if a in valid_actions else 0 for a in range(env_wrapper.action_size)]
+                    next_valid_actions=env_wrapper.get_valid_actions()
+                    next_valid_mask = [1 if a in next_valid_actions else 0 for a in range(env_wrapper.action_size)]
+                    agent.remember(state, action, reward, next_state, done, valid_mask, next_valid_mask)
                     
                     # replay a intervalli per velocità
                     if step_counter % replay_frequency == 0:
@@ -350,7 +441,10 @@ def train(env_wrapper, episodes=5, use_llm_helper=True, render_env=False,
                 action = agent.act(state, valid_actions)
                 next_state_raw, reward, done, info = env_wrapper.step(action)
                 next_state = flatten_obs(next_state_raw)
-                agent.remember(state, action, reward, next_state, done)
+                valid_mask = [1 if a in valid_actions else 0 for a in range(env_wrapper.action_size)]
+                next_valid_actions=env_wrapper.get_valid_actions()
+                next_valid_mask = [1 if a in next_valid_actions else 0 for a in range(env_wrapper.action_size)]
+                agent.remember(state, action, reward, next_state, done, valid_mask, next_valid_mask)
                 if step_counter % replay_frequency == 0:
                     agent.replay()
                 state = next_state
@@ -402,7 +496,7 @@ def plot_stats(stats):
     plt.xlabel("Episode")
     plt.ylabel("Reward")
     plt.tight_layout()
-    plt.savefig("rewards.png")
+    plt.savefig("plots\\rewards.png")
     
     plt.figure(figsize=(8,4))
     plt.plot(stats["episode_moves"])
@@ -410,7 +504,7 @@ def plot_stats(stats):
     plt.xlabel("Episode")
     plt.ylabel("Moves")
     plt.tight_layout()
-    plt.savefig("moves.png")
+    plt.savefig("plots\\moves.png")
     
     plt.figure(figsize=(8,4))
     plt.plot(stats["llm_suggestions_used"], label="sugg used")
@@ -418,7 +512,7 @@ def plot_stats(stats):
     plt.legend()
     plt.title("LLM suggestions / hallucinations")
     plt.tight_layout()
-    plt.savefig("llm_stats.png")
+    plt.savefig("plots\\llm_stats.png")
 
 # ---------------- Main ----------------
 if __name__=="__main__":
@@ -426,12 +520,57 @@ if __name__=="__main__":
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--llm", action="store_true")
     parser.add_argument("--episodes", type=int, default=5)
-    parser.add_argument("--max-steps", type=int, default=4)
+    parser.add_argument("--max-steps", type=int, default=10, help="massimo step tra chiamate LLM")
     parser.add_argument("--replay-freq", type=int, default=4, help="quante volte chiamare agent.replay() (meno = più veloce)")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
     
-    env = gym.make("MiniGrid-Empty-5x5-v0", render_mode="human" if args.render else None)
+
+    env_options = {
+    "1": {
+        "label": "Crossing",
+        "ids": [
+            "MiniGrid-LavaCrossingS9N1-v0",
+            "MiniGrid-LavaCrossingS9N3-v0",
+            "MiniGrid-LavaCrossingS11N5-v0",
+        ],
+    },
+    "2": {
+        "label": "DoorKey",
+        "ids": [
+            "MiniGrid-DoorKey-5x5-v0",
+            "MiniGrid-DoorKey-8x8-v0",
+            "MiniGrid-DoorKey-16x16-v0",
+        ],
+    },
+    "3": {
+        "label": "Empty",
+        "ids": [
+            "MiniGrid-Empty-5x5-v0",
+            "MiniGrid-Empty-8x8-v0",
+            "MiniGrid-Empty-16x16-v0",
+        ],
+    },
+}
+
+    # Scelta dell'ambiente
+    while True:
+        choice = input("Scegli l'ambiente (1=Crossing, 2=DoorKey, 3=Empty): ").strip()
+        if choice in env_options:
+            break
+        print("Scelta non valida, inserisci 1, 2 o 3.")
+
+        # Scelta della dimensione
+    while True:
+        size = input("Scegli la dimensione della mappa (1=piccolo, 2=medio, 3=grande): ").strip()
+        if size in ("1", "2", "3"):
+            break
+        print("Scelta non valida, inserisci 1, 2 o 3.")
+
+    env_id = env_options[choice]["ids"][int(size) - 1]
+    print(f"Ambiente selezionato: {env_options[choice]['label']} -> {env_id}")
+
+    env = gym.make(env_id, render_mode="human" if args.render else None)
     env = FullyObsWrapper(env)
     env_wrapper = DynamicMiniGridWrapper(env, task_type="Empty")
     

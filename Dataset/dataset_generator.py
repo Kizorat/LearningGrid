@@ -1,11 +1,9 @@
 import csv
 import random
 import heapq
-import math
+import itertools
 
-# ================================================================
-# CONFIGURAZIONI DELLE MAPPE
-# ================================================================
+# Map configurations for different MiniGrid environments
 ENV_CONFIGS = {
     # Empty maps
     "MiniGrid-Empty-5x5-v0": {"size": 5, "type": "empty"},
@@ -13,9 +11,9 @@ ENV_CONFIGS = {
     "MiniGrid-Empty-16x16-v0": {"size": 16, "type": "empty"},
 
     # LavaCrossing maps
-    "MiniGrid-LavaCrossingS9N1-v0": {"size": 9, "type": "lava"},
-    "MiniGrid-LavaCrossingS9N3-v0": {"size": 9, "type": "lava"},
-    "MiniGrid-LavaCrossingS11N5-v0": {"size": 11, "type": "lava"},
+    "MiniGrid-LavaCrossingS9N1-v0": {"size": 9, "type": "lava", "crossings": 1},
+    "MiniGrid-LavaCrossingS9N3-v0": {"size": 9, "type": "lava", "crossings": 3},
+    "MiniGrid-LavaCrossingS11N5-v0": {"size": 11, "type": "lava", "crossings": 5},
 
     # DoorKey maps
     "MiniGrid-DoorKey-5x5-v0": {"size": 5, "type": "doorkey"},
@@ -23,9 +21,7 @@ ENV_CONFIGS = {
     "MiniGrid-DoorKey-16x16-v0": {"size": 16, "type": "doorkey"},
 }
 
-# ================================================================
-# DIREZIONI
-# ================================================================
+# Direction mappings
 DIRECTIONS = ["East", "South", "West", "North"]
 DIR_DELTA = {
     0: (1, 0),
@@ -34,9 +30,13 @@ DIR_DELTA = {
     3: (0, -1),
 }
 
-# ================================================================
-# COSTRUZIONE DELLE MAPPE
-# ================================================================
+# Base actions
+BASE_ACTIONS = ["left", "right", "forward"]
+# Extra actions for DoorKey
+DOORKEY_ACTIONS = ["pickup", "toggle"]
+
+# Grid Building Functions
+# Empty map building
 def build_grid_empty(size):
     grid = [[" " for _ in range(size)] for _ in range(size)]
     for i in range(size):
@@ -46,52 +46,153 @@ def build_grid_empty(size):
         grid[i][size-1] = "#"
     return grid
 
-def build_grid_lava(size, n_gaps):
+# LavaCrossing map building
+def build_grid_crossing(size, num_crossings, obstacle_char="L"):
     grid = build_grid_empty(size)
+    height, width = size, size
+    
+    # 1. Identify potential river positions
+    # Vertical rivers occur at even x indices: 2, 4, ...
+    rivers_v_candidates = [i for i in range(2, width - 2, 2)]
+    # Horizontal rivers occur at even y indices: 2, 4, ...
+    rivers_h_candidates = [j for j in range(2, height - 2, 2)]
+    
+    # 2. Select specific rivers
+    # We treat vertical (0) and horizontal (1) rivers as items to shuffle and pick
+    all_rivers = []
+    for x in rivers_v_candidates:
+        all_rivers.append((0, x)) # (Direction=Vertical, Coord=x)
+    for y in rivers_h_candidates:
+        all_rivers.append((1, y)) # (Direction=Horizontal, Coord=y)
+        
+    random.shuffle(all_rivers)
+    
+    # Take only the number of crossings requested
+    selected_rivers = all_rivers[:num_crossings]
+    
+    # Separate and sort them
+    rivers_v = sorted([pos for (d, pos) in selected_rivers if d == 0])
+    rivers_h = sorted([pos for (d, pos) in selected_rivers if d == 1])
+    
+    # 3. Place Obstacles
+    # Fill vertical rivers
+    for x in rivers_v:
+        for y in range(1, height - 1):
+            grid[y][x] = obstacle_char
+            
+    # Fill horizontal rivers
+    for y in rivers_h:
+        for x in range(1, width - 1):
+            grid[y][x] = obstacle_char
 
-    row_lava = size // 2
-    for x in range(1, size-1):
-        grid[row_lava][x] = "L"
+    # 4. Create Openings (Gaps)
+    
+    path_moves = ['cross_col'] * len(rivers_v) + ['cross_row'] * len(rivers_h)
+    random.shuffle(path_moves)
+    
+    gap_info = []
+    
+    # Limits define the boundaries of the current "room"
+    limits_v = [0] + rivers_v + [width - 1]
+    limits_h = [0] + rivers_h + [height - 1]
+    
+    # Indices tracking which room we are in
+    room_i = 0
+    room_j = 0
+    
+    for move in path_moves:
+        if move == 'cross_col':
+            # We are crossing the vertical river at limits_v[room_i + 1]
+            river_x = limits_v[room_i + 1]
+            
+            # The gap must be within the current horizontal strip (between current row limits)
+            min_y = limits_h[room_j] + 1
+            max_y = limits_h[room_j + 1]
+            gap_y = random.choice(range(min_y, max_y))
+            
+            grid[gap_y][river_x] = " " # Clear lava
+            gap_info.append(f"Vertical river at x={river_x} has gap at y={gap_y}")
+            
+            # Move index to next column compartment
+            room_i += 1
+            
+        elif move == 'cross_row':
+            # We are crossing the horizontal river at limits_h[room_j + 1]
+            river_y = limits_h[room_j + 1]
+            
+            # The gap must be within the current vertical strip (between current col limits)
+            min_x = limits_v[room_i] + 1
+            max_x = limits_v[room_i + 1]
+            gap_x = random.choice(range(min_x, max_x))
+            
+            grid[river_y][gap_x] = " " # Clear lava
+            gap_info.append(f"Horizontal river at y={river_y} has gap at x={gap_x}")
+            
+            # Move index to next row compartment
+            room_j += 1
+            
+    return grid, gap_info
 
-    gaps = random.sample(range(1, size-1), n_gaps)
-    for g in gaps:
-        grid[row_lava][g] = " "
-
-    return grid, (row_lava, gaps)
-
+# DoorKey map building
 def build_grid_doorkey(size):
     grid = build_grid_empty(size)
-    return grid
+    
+    # 1. Place Wall column (ensure space on both sides)
+    split_col = random.randint(2, size - 3)
+    for y in range(1, size - 1):
+        grid[y][split_col] = "W" 
+        
+    # 2. Place Door at random height in the wall
+    door_y = random.randint(1, size - 2)
+    grid[door_y][split_col] = "D"
+    door_pos = (split_col, door_y)
+    
+    # 3. Place Key on the left side (agent side)
+    key_x = random.randint(1, split_col - 1)
+    key_y = random.randint(1, size - 2)
+    key_pos = (key_x, key_y)
+    grid[key_y][key_x] = "K" 
 
-# ================================================================
-# A* PESATO SU POSIZIONE + DIREZIONE
-# ================================================================
-def rotation_cost(d1, d2):
-    diff = abs(d1 - d2) % 4
-    return min(diff, 4 - diff)
+    return grid, split_col, door_pos, key_pos
 
-def heuristic(pos, dir, goal):
+# Pathfinding's logic
+# Heuristic function for A* (Manhattan distance)
+def heuristic(pos, goal):
+    return abs(pos[0] - goal[0]) + abs(pos[1] - goal[1])
+
+# Check if position is valid
+def valid(grid, pos, ignore_obstacles=None):
+    if ignore_obstacles is None:
+        ignore_obstacles = []
+        
     x, y = pos
-    gx, gy = goal
-    man = abs(x - gx) + abs(y - gy)
-    if abs(gx - x) > abs(gy - y):
-        desired = 0 if gx > x else 2
-    else:
-        desired = 1 if gy > y else 3
-    rot = rotation_cost(dir, desired)
-    return man + 1.5 * rot
-
-def valid(grid, pos):
-    x, y = pos
-    if y < 0 or y >= len(grid):
+    if y < 0 or y >= len(grid) or x < 0 or x >= len(grid[0]):
         return False
-    if x < 0 or x >= len(grid[0]):
+    
+    cell = grid[y][x]
+    
+    # Always obstacles
+    if cell in ["#", "L", "W"]:
         return False
-    if grid[y][x] in ["#", "L"]:
+    
+    if cell == "K" and "K" not in ignore_obstacles:
         return False
+    if cell == "D" and "D" not in ignore_obstacles:
+        return False
+        
     return True
 
-def astar(grid, start_pos, start_dir, goal_pos):
+# Get turn actions
+def get_turn_actions(current_dir, desired_dir):
+    diff = (desired_dir - current_dir) % 4
+    if diff == 0: return []
+    if diff == 1: return ["right"]
+    if diff == 2: return ["right", "right"] 
+    if diff == 3: return ["left"]
+    return []
+
+# A* Search Algorithm
+def astar(grid, start_pos, start_dir, goal_pos, ignore_obstacles=None):
     start = (start_pos, start_dir)
     frontier = []
     heapq.heappush(frontier, (0, start))
@@ -99,102 +200,183 @@ def astar(grid, start_pos, start_dir, goal_pos):
     came_from = {start: None}
     action_from = {start: None}
     cost_so_far = {start: 0}
+    
+    best_end_state = None
 
     while frontier:
-        _, (pos, dir) = heapq.heappop(frontier)
+        _, (pos, direction) = heapq.heappop(frontier)
 
         if pos == goal_pos:
+            best_end_state = (pos, direction)
             break
 
         x, y = pos
-
         successors = [
-            ("left",  (pos, (dir - 1) % 4)),
-            ("right", (pos, (dir + 1) % 4)),
-            ("forward", ((x + DIR_DELTA[dir][0], y + DIR_DELTA[dir][1]), dir)),
+            ("left",  (pos, (direction - 1) % 4)),
+            ("right", (pos, (direction + 1) % 4)),
+            ("forward", ((x + DIR_DELTA[direction][0], y + DIR_DELTA[direction][1]), direction)),
         ]
 
         for action, new_state in successors:
             new_pos, new_dir = new_state
 
-            if action == "forward" and not valid(grid, new_pos):
-                continue
+            if action == "forward":
+                if not valid(grid, new_pos, ignore_obstacles):
+                    continue
 
-            new_cost = cost_so_far[(pos, dir)] + 1
+            new_cost = cost_so_far[(pos, direction)] + 1
 
             if (new_pos, new_dir) not in cost_so_far or new_cost < cost_so_far[(new_pos, new_dir)]:
                 cost_so_far[(new_pos, new_dir)] = new_cost
-                priority = new_cost + heuristic(new_pos, new_dir, goal_pos)
+                priority = new_cost + heuristic(new_pos, goal_pos)
                 heapq.heappush(frontier, (priority, (new_pos, new_dir)))
-                came_from[(new_pos, new_dir)] = (pos, dir)
+                came_from[(new_pos, new_dir)] = (pos, direction)
                 action_from[(new_pos, new_dir)] = action
 
-    goal_states = [s for s in cost_so_far if s[0] == goal_pos]
-    if not goal_states:
-        return []
+    if best_end_state is None:
+        return None, None
 
-    end = min(goal_states, key=lambda s: cost_so_far[s])
     actions = []
-
-    cur = end
+    cur = best_end_state
     while action_from[cur] is not None:
         actions.append(action_from[cur])
         cur = came_from[cur]
-
     actions.reverse()
-    return actions
+    
+    return actions, best_end_state
 
-# ================================================================
-# GENERAZIONE SCENARI
-# ================================================================
+# Path to subgoals
+def path_to_interaction(grid, start_pos, start_dir, target_pos, ignore_obstacles=None):
+    tx, ty = target_pos
+    neighbors = [
+        ((tx - 1, ty), 0), 
+        ((tx, ty - 1), 1), 
+        ((tx + 1, ty), 2), 
+        ((tx, ty + 1), 3) 
+    ]
+    
+    best_path = None
+    best_state = None
+    min_len = float('inf')
+
+    for n_pos, req_dir in neighbors:
+        if valid(grid, n_pos, ignore_obstacles):
+            path, end_state = astar(grid, start_pos, start_dir, n_pos, ignore_obstacles)
+            
+            if end_state:
+                curr_dir = end_state[1]
+                turn_actions = get_turn_actions(curr_dir, req_dir)
+                full_path = path + turn_actions
+                
+                if len(full_path) < min_len:
+                    min_len = len(full_path)
+                    best_path = full_path
+                    best_state = (n_pos, req_dir) 
+
+    return best_path, best_state
+
+# Generator's logic
 def generate_scenario(env_name, config):
     size = config["size"]
     env_type = config["type"]
 
-    if env_type == "empty":
-        grid = build_grid_empty(size)
+    while True:
+        key_pos = None
+        door_pos = None
+        lava_gaps = []
 
-    elif env_type == "lava":
-        mapname = env_name
-        n = int(mapname.split("N")[-1].split("-")[0])
-        grid, lava_info = build_grid_lava(size, n)
+        if env_type == "empty":
+            grid = build_grid_empty(size)
+        elif env_type == "lava":
+            # Use crossing logic
+            num_crossings = config.get("crossings", 1)
+            grid, lava_gaps = build_grid_crossing(size, num_crossings)
+        elif env_type == "doorkey":
+            grid, split_col, door_pos, key_pos = build_grid_doorkey(size)
 
-    elif env_type == "doorkey":
-        grid = build_grid_doorkey(size)
+        # Generate Agent and Goal positions
+        if env_type == "doorkey":
+            agent_x = random.randint(1, split_col - 1)
+            agent_y = random.randint(1, size - 2)
+            goal_x = random.randint(split_col + 1, size - 2)
+            goal_y = random.randint(1, size - 2)
+        else:
+            agent_x = random.randint(1, size-2)
+            agent_y = random.randint(1, size-2)
+            goal_x = size-2
+            goal_y = size-2
 
-    agent_pos = (random.randint(1, size-2), random.randint(1, size-2))
-    agent_dir = random.randint(0, 3)
-    goal_pos = (size-2, size-2)
-    grid[goal_pos[1]][goal_pos[0]] = "G"
+            if env_type == "lava":
+                 agent_x, agent_y = 1, 1
 
-    return {
-        "env_name": env_name,
-        "grid": grid,
-        "agent_pos": agent_pos,
-        "agent_dir": agent_dir,
-        "goal_pos": goal_pos,
-        "type": env_type
-    }
+        agent_pos = (agent_x, agent_y)
+        goal_pos = (goal_x, goal_y)
+        agent_dir = random.randint(0, 3)
 
-# ================================================================
-# GENERAZIONE DELLE ISTRUZIONI OTTIMALI
-# ================================================================
+        # Collision checks
+        if grid[agent_y][agent_x] != " ":
+            continue
+        if grid[goal_y][goal_x] != " ":
+            continue
+        if agent_pos == goal_pos:
+            continue
+
+        grid[goal_y][goal_x] = "G"
+        
+        return {
+            "env_name": env_name,
+            "grid": grid,
+            "agent_pos": agent_pos,
+            "agent_dir": agent_dir,
+            "goal_pos": goal_pos,
+            "key_pos": key_pos,
+            "door_pos": door_pos,
+            "lava_gaps": lava_gaps,
+            "type": env_type
+        }
+
+# Generate instructions based on optimal path
 def generate_instructions(scenario):
     grid = scenario["grid"]
     agent_pos = scenario["agent_pos"]
     agent_dir = scenario["agent_dir"]
     goal_pos = scenario["goal_pos"]
+    env_type = scenario["type"]
 
-    path = astar(grid, agent_pos, agent_dir, goal_pos)
+    if agent_pos == goal_pos:
+        return "Goal reached."
 
-    if not path:
-        return "No valid path to goal."
+    full_path = []
 
-    return "Optimal action sequence: [" + ", ".join(path) + "]."
+    if env_type == "doorkey":
+        key_pos = scenario["key_pos"]
+        door_pos = scenario["door_pos"]
+        
+        path1, state1 = path_to_interaction(grid, agent_pos, agent_dir, key_pos, ignore_obstacles=[])
+        if path1 is None: return "No valid path to reach key."
+        full_path.extend(path1)
+        full_path.append("pickup")
+        
+        curr_pos, curr_dir = state1
+        path2, state2 = path_to_interaction(grid, curr_pos, curr_dir, door_pos, ignore_obstacles=["K"])
+        if path2 is None: return "No valid path from key to door."
+        full_path.extend(path2)
+        full_path.append("toggle")
+        
+        curr_pos, curr_dir = state2
+        path3, state3 = astar(grid, curr_pos, curr_dir, goal_pos, ignore_obstacles=["K", "D"])
+        if path3 is None: return "No valid path from door to goal."
+        full_path.extend(path3)
 
-# ================================================================
-# DATASET
-# ================================================================
+    else:
+        path, _ = astar(grid, agent_pos, agent_dir, goal_pos)
+        if not path:
+            return "No valid path to goal."
+        full_path.extend(path)
+
+    return "Optimal action sequence: [" + ", ".join(full_path) + "]."
+
+# Main dataset generation function
 def generate_minigrid_dataset(rows_per_map=50):
     dataset = []
 
@@ -203,34 +385,52 @@ def generate_minigrid_dataset(rows_per_map=50):
             scenario = generate_scenario(map_name, config)
             instructions = generate_instructions(scenario)
 
-            dir_str = DIRECTIONS[scenario["agent_dir"]]
+            # Skip scenarios with no valid path
+            if instructions.startswith("No valid path"):
+                continue
 
-            prompt = (
+            dir_str = DIRECTIONS[scenario["agent_dir"]]
+            
+            base_info = (
                 f"Environment: {scenario['env_name']}. "
                 f"Agent at {scenario['agent_pos']} facing {dir_str}. "
                 f"Goal at {scenario['goal_pos']}. "
                 f"Map size: {config['size']}x{config['size']}."
             )
+            
+            if config['type'] == 'doorkey':
+                extra_info = f" Key at {scenario['key_pos']}. Door at {scenario['door_pos']}."
+                prompt = base_info + extra_info
+                possible_acts = BASE_ACTIONS + DOORKEY_ACTIONS
+            else:
+                prompt = base_info
+                possible_acts = BASE_ACTIONS
 
-            dataset.append({
+            random_action = random.choice(possible_acts)
+            response = f"The next action to take is {random_action}."
+
+            data_row = {
                 "prompt": prompt,
-                "response": "The next action to take is [unknown].",
-                "instructions": instructions
-            })
+                "response": response,
+                "instructions": instructions,
+                "lava_gaps": "; ".join(scenario["lava_gaps"]) if scenario["lava_gaps"] else "N/A"
+            }
+            dataset.append(data_row)
 
     return dataset
 
-def save_to_csv(dataset, filename="minigrid_dataset.csv"):
+# Save dataset to CSV
+def save_to_csv(dataset, filename="Dataset/minigrid_dataset.csv"):
+    if not dataset:
+        return
     keys = dataset[0].keys()
     with open(filename, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=keys)
         writer.writeheader()
         writer.writerows(dataset)
 
-# ================================================================
-# MAIN
-# ================================================================
+# Main execution
 if __name__ == "__main__":
-    dataset = generate_minigrid_dataset(rows_per_map=100)
+    dataset = generate_minigrid_dataset(rows_per_map=150)
     save_to_csv(dataset)
     print("Dataset generated successfully.")

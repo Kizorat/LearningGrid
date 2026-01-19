@@ -1,56 +1,94 @@
-# agent_pro.py
-
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from collections import deque
 import random
+import heapq
 
-# ------------------ MODELLO DQN ------------------
+# rete neurale con Dueling Architecture
 class DQN(nn.Module):
-    def __init__(self, state_size, action_size):
+    def __init__(self, state_size, action_size, dueling=False):
         super(DQN, self).__init__()
-        self.fc1 = nn.Linear(state_size, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.fc3 = nn.Linear(128, action_size)
+        self.dueling = dueling
+        
+        # Layers condivisi
+        self.fc1 = nn.Linear(state_size, 256)
+        self.fc2 = nn.Linear(256, 256)
+        
+        if dueling:
+            # Dueling architecture
+            self.fc_value = nn.Linear(256, 128)
+            self.value = nn.Linear(128, 1)
+            
+            self.fc_adv = nn.Linear(256, 128)
+            self.advantage = nn.Linear(128, action_size)
+        else:
+            self.fc3 = nn.Linear(256, action_size)
     
     def forward(self, x):
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
-        return self.fc3(x)
+        
+        if self.dueling:
+            # Value stream
+            v = torch.relu(self.fc_value(x))
+            v = self.value(v)
+            
+            # Advantage stream
+            a = torch.relu(self.fc_adv(x))
+            a = self.advantage(a)
+            
+            # Combine: Q = V + (A - mean(A))
+            q = v + a - a.mean(dim=1, keepdim=True)
+            return q
+        else:
+            return self.fc3(x)
 
-# ------------------ AGENTE DQN ------------------
+# DQN Agent migliorato
 class DQNAgent:
-    def __init__(self, state_size, action_size, device=None, replay_buffer_size=30000, batch_size=64):
+    def __init__(self, state_size, action_size, device=None, replay_buffer_size=100000, batch_size=64, dueling=True, prioritized=False):
         self.state_size = state_size
         self.action_size = action_size
         self.replay_buffer = deque(maxlen=replay_buffer_size)
         self.batch_size = batch_size
+        self.prioritized = prioritized
+        
+        # Per prioritized experience replay
+        if prioritized:
+            self.priorities = deque(maxlen=replay_buffer_size)
 
-        # Hyperparameters
-        self.gamma = 0.95
-        self.epsilon = 1.0
-        self.epsilon_min = 0.01
-        self.epsilon_decay = 0.9995
-        self.learning_rate = 0.001
+        # Hyperparameters 
+        self.gamma = 0.99  # Fattore di sconto
+        self.epsilon = 1.0 # Inizialmente molta esplorazione
+        self.epsilon_min = 0.10  # Minimo più alto per mappe grandi
+        self.epsilon_decay = 0.9999  # Decay più lento
+        self.learning_rate = 0.0003  # Learning rate più basso
+        self.target_update_freq = 100  # Aggiorna target ogni N step
+        self.tau = 0.005  # Soft update factor per target network
+        self.step_count = 0 # Conta gli step per aggiornare il target network
+        
+        # Double DQN
+        self.use_double_dqn = True
 
         # Device
         self.device = torch.device(device) if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"🖥️  DQNAgent running on {self.device}")
+        print(f"DQNAgent running on {self.device}")
 
-        # Models
-        self.model = DQN(state_size, action_size).to(self.device)
-        self.target_model = DQN(state_size, action_size).to(self.device)
+        # Models con Dueling architecture
+        self.model = DQN(state_size, action_size, dueling=dueling).to(self.device)
+        self.target_model = DQN(state_size, action_size, dueling=dueling).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
-        self.criterion = nn.MSELoss()
+        self.criterion = nn.HuberLoss()  # Huber loss, più stabile delle MSE
 
         # Initialize target model
         self.update_target_model()
 
-    # ------------------ FUNZIONI BASE ------------------
+    # Aggiorna il target model con soft update
     def update_target_model(self):
-        self.target_model.load_state_dict(self.model.state_dict())
+        """ Target model con soft update """
+        for target_param, local_param in zip(self.target_model.parameters(), self.model.parameters()):
+            target_param.data.copy_(self.tau * local_param.data + (1.0 - self.tau) * target_param.data)
 
     def remember(self, state, action, reward, next_state, done,valid_mask, next_valid_mask):
         # Flatten stati se multidimensionali
@@ -83,7 +121,12 @@ class DQNAgent:
             return
 
         for _ in range(n_steps):
-            minibatch = random.sample(self.replay_buffer, self.batch_size)
+            if self.prioritized:
+                # Prioritized Experience Replay
+                minibatch_indices = self._sample_prioritized_batch()
+                minibatch = [self.replay_buffer[i] for i in minibatch_indices]
+            else:
+                minibatch = random.sample(self.replay_buffer, self.batch_size)
 
             states = torch.FloatTensor(np.array([x[0] for x in minibatch])).to(self.device)
             actions = torch.LongTensor([x[1] for x in minibatch]).to(self.device)
@@ -94,22 +137,52 @@ class DQNAgent:
             # Q-values correnti
             current_q = self.model(states).gather(1, actions.unsqueeze(1)).squeeze(1)
 
-            # Q-values target
+            # Double DQN: azioni dal model principale, valutate dal target
             with torch.no_grad():
-                next_q = self.target_model(next_states).max(1)[0]
+                if self.use_double_dqn:
+                    next_actions = self.model(next_states).argmax(1)
+                    next_q = self.target_model(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
+                else:
+                    next_q = self.target_model(next_states).max(1)[0]
+                
                 target_q = rewards + (1 - dones) * self.gamma * next_q
 
-            # Loss e backprop
+            # Loss e backpropagation
             loss = self.criterion(current_q, target_q)
             self.optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
+            
+            # Aggiorna priorità se usiamo prioritized replay
+            if self.prioritized and hasattr(self, '_last_minibatch_indices'):
+                td_errors = (target_q - current_q).detach().cpu().numpy()
+                for idx, td_error in zip(self._last_minibatch_indices, td_errors):
+                    if idx < len(self.priorities):
+                        self.priorities[idx] = abs(td_error) + 1e-6
+
+            self.step_count += 1
+            
+            # Aggiorna target model ogni N step
+            if self.step_count % self.target_update_freq == 0:
+                self.update_target_model()
 
         # Decay epsilon
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
+    
+    def _sample_prioritized_batch(self):
+        """Campiona dal replay buffer usando le priorità."""
+        if len(self.priorities) == 0:
+            return random.sample(range(len(self.replay_buffer)), self.batch_size)
+        
+        priorities = np.array(self.priorities)
+        priorities = priorities / priorities.sum()
+        indices = np.random.choice(len(self.replay_buffer), size=self.batch_size, p=priorities)
+        self._last_minibatch_indices = indices
+        return indices
 
-    # ------------------ SALVATAGGIO / CARICAMENTO ------------------
+    # Salva il modello su file
     def save(self, filename):
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
@@ -118,7 +191,7 @@ class DQNAgent:
             'epsilon': self.epsilon
         }
         torch.save(checkpoint, filename)
-        print(f"✓ Modello salvato: {filename}")
+        print(f"Modello salvato: {filename}")
 
     def load(self, filename):
         checkpoint = torch.load(filename, map_location=self.device)
@@ -126,4 +199,4 @@ class DQNAgent:
         self.target_model.load_state_dict(checkpoint['target_model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.epsilon = checkpoint['epsilon']
-        print(f"✓ Modello caricato: {filename}")
+        print(f"Modello caricato: {filename}")

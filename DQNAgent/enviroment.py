@@ -271,7 +271,7 @@ class DynamicMiniGridWrapper:
         return self._get_context_features()[2:]
     
     def _detect_key_and_door_positions(self):
-       """Rileva e memorizza le posizioni della chiave e della porta nella griglia."""
+        """Rileva e memorizza le posizioni della chiave e della porta nella griglia."""
         grid = self.base_env.grid
         for x in range(grid.width):
             for y in range(grid.height):
@@ -435,17 +435,17 @@ class DynamicMiniGridWrapper:
         # Se path è vuoto, consenti replans infiniti
         if not self.episode_astar_cell_path:
             if self.astar_replans_used < 10:  # Limita solo per debug
-                #print(f" A* replan (empty path, attempt {self.astar_replans_used + 1})")
+                pass  #print(f" A* replan (empty path, attempt {self.astar_replans_used + 1})")
             self.episode_astar_cell_path = self._compute_astar_cell_path()
             self.astar_replans_used += 1
             if self.episode_astar_cell_path and self.astar_replans_used < 10:
-                #print(f"New path: {len(self.episode_astar_cell_path)} cells")
+                pass  #print(f"New path: {len(self.episode_astar_cell_path)} cells")
             return
         
         # Se agente esce dal path, replan illimitato
         if pos not in self.episode_astar_cell_path:
             if self.astar_replans_used < 10: 
-                #print(f" A* replan #{self.astar_replans_used + 1} (agent off path at {pos})")
+                pass  #print(f" A* replan #{self.astar_replans_used + 1} (agent off path at {pos})")
             self.episode_astar_cell_path = self._compute_astar_cell_path()
             self.astar_replans_used += 1
 

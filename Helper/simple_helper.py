@@ -479,7 +479,7 @@ def get_optimal_path_length(grid, agent_pos, agent_dir, goal_pos, env_type="empt
 
 # ---------------- LLM Helper ----------------
 class LLMHelper:
-    def __init__(self, model_name="mistral:7b", verbose=False, env_type="empty"):
+    def __init__(self, model_name="qwen3:8b", verbose=False, env_type="empty"):
         self.verbose=verbose
         self.model_name=model_name
         self.env_type=env_type
@@ -641,9 +641,19 @@ LIMIT: Suggest MAX {max_actions} actions.
             if current_target:
                 # Per chiave e porta, vai alla cella adiacente
                 if phase in ['get_key', 'open_door']:
-                    path_actions, end_state = path_to_interaction_grid(grid, agent_pos, agent_dir, current_target)
-                    if path_actions:
-                        path_actions = path_actions + [required_final_action]
+                    # Check if agent is ALREADY in position to interact
+                    if is_agent_in_front_of(agent_pos, agent_dir, current_target):
+                        # Agent is already facing the target, just need the action
+                        path_actions = [required_final_action]
+                        if self.verbose:
+                            cprint.success(f"Agent già in posizione per {required_final_action}!")
+                    else:
+                        # Need to navigate to target
+                        path_actions, end_state = path_to_interaction_grid(grid, agent_pos, agent_dir, current_target)
+                        if path_actions:
+                            path_actions = path_actions + [required_final_action]
+                        elif end_state is None and self.verbose:
+                            cprint.warn(f"Impossibile trovare path verso {current_target}")
                     hint_label = "SUGGESTED PATH"
                 else:
                     # --- FASE 3: Calcolo A* puro verso il goal ---

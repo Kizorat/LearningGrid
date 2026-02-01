@@ -24,6 +24,8 @@ import torch
 import re
 import ollama
 import gymnasium as gym
+import csv
+from datetime import datetime
 from minigrid.wrappers import FullyObsWrapper
 from DQNAgent.agent import DQNAgent
 from DQNAgent.enviroment import DynamicMiniGridWrapper
@@ -479,18 +481,76 @@ def get_optimal_path_length(grid, agent_pos, agent_dir, goal_pos, env_type="empt
 
 # ---------------- LLM Helper ----------------
 class LLMHelper:
-    def __init__(self, model_name="qwen3:8b", verbose=False, env_type="empty"):
+    def __init__(self, model_name="mistral:7b", verbose=False, env_type="empty"):
         self.verbose=verbose
         self.model_name=model_name
         self.env_type=env_type
         # Tracking per DoorKey - per rilevare allucinazioni
         self.pickup_executed = False
         self.toggle_executed = False
+        # Tracking chiamate helper per logging
+        self.call_number = 0
+        self.csv_writer = None
+        self.csv_file = None
 
     def reset_doorkey_state(self):
         """Reset stato DoorKey per nuovo episodio"""
         self.pickup_executed = False
         self.toggle_executed = False
+    
+    def init_logging(self, env_name):
+        """Inizializza il logging CSV in una cartella con timestamp"""
+        # Crea cartella con data e ora
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        log_dir = ROOT_DIR / "Helper" / "Logs" / timestamp
+        log_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Crea file CSV
+        csv_path = log_dir / "helper_calls.csv"
+        self.csv_file = open(csv_path, 'w', newline='', encoding='utf-8')
+        self.csv_writer = csv.writer(self.csv_file)
+        # Scrivi header
+        self.csv_writer.writerow(["Environment", "Episodio", "Chiamata_numero", "Numero_azioni_suggerite", "Azioni_parsate"])
+        self.csv_file.flush()
+        
+        self.env_name = env_name
+        self.current_episode = 0
+        
+        if self.verbose:
+            cprint.success(f"Logging inizializzato in: {csv_path}")
+    
+    def reset_episode(self, episode_num):
+        """Reset contatori per nuovo episodio"""
+        self.call_number = 0
+        self.current_episode = episode_num
+        self.reset_doorkey_state()
+        
+        if self.verbose:
+            cprint.info(f"Episodio {episode_num}: contatori azzerati")
+    
+    def log_call(self, num_suggested, num_parsed):
+        """Registra una chiamata dell'helper nel CSV"""
+        self.call_number += 1
+        
+        if self.csv_writer:
+            self.csv_writer.writerow([
+                self.env_name,
+                self.current_episode,
+                self.call_number,
+                num_suggested,
+                num_parsed
+            ])
+            self.csv_file.flush()
+            
+            if self.verbose:
+                cprint.info(f"Logged call #{self.call_number}: {num_suggested} suggested, {num_parsed} parsed")
+    
+    def close_logging(self):
+        """Chiude il file CSV"""
+        if self.csv_file:
+            self.csv_file.close()
+            if self.verbose:
+                cprint.success("Logging chiuso")
 
     def get_cell_info(self, grid, x, y):
         """Restituisce info sulla cella"""
@@ -813,6 +873,9 @@ LIMIT: Suggest MAX {max_actions} actions.
         if self.verbose:
             cprint.success(f"Azioni valide: {len(safe)}/{len(seq)}")
         
+        # Log della chiamata: azioni suggerite dall'LLM vs azioni parsate valide
+        self.log_call(len(seq), len(safe))
+        
         # Restituisce (azioni_valide, 1 se c'è stata troncatura, 0 altrimenti)
         was_truncated = 1 if len(safe) < len(seq) else 0
         return safe, was_truncated
@@ -1012,6 +1075,9 @@ LIMIT: Suggest MAX {max_actions} actions.
             if has_hallucination:
                 cprint.error(f"Allucinazione rilevata in questa risposta")
         
+        # Log della chiamata: azioni suggerite dall'LLM vs azioni parsate valide
+        self.log_call(len(seq), len(safe))
+        
         # Ritorna 1 se c'è stata almeno un'allucinazione, 0 altrimenti
         return safe, 1 if has_hallucination else 0
 
@@ -1047,6 +1113,11 @@ def train(env_wrapper, env_id="MiniGrid", episodes=5, use_llm_helper=True, rende
     # Determina il tipo di ambiente
     env_type = getattr(env_wrapper, 'task_type', 'empty')
     helper=LLMHelper(verbose=verbose, env_type=env_type) if use_llm_helper else None
+    
+    # Inizializza logging se helper è attivo
+    if helper:
+        helper.init_logging(env_id)
+    
     stats={"episode_rewards":[],"episode_moves":[],"llm_suggestions_used":[],"llm_hallucinations":[]}
 
     # --- SETUP LAYOUT MANAGER ---
@@ -1067,9 +1138,9 @@ def train(env_wrapper, env_id="MiniGrid", episodes=5, use_llm_helper=True, rende
         ep_hall=0
         step_counter=0
         
-        # Reset stato DoorKey per nuovo episodio
-        if helper and env_type == "DoorKey":
-            helper.reset_doorkey_state()
+        # Reset contatori helper per nuovo episodio
+        if helper:
+            helper.reset_episode(ep + 1)
 
         # Update testo iniziale layout
         if layout_mgr:
@@ -1264,6 +1335,10 @@ def train(env_wrapper, env_id="MiniGrid", episodes=5, use_llm_helper=True, rende
 
     if layout_mgr:
         layout_mgr.close()
+    
+    # Chiudi il logging
+    if helper:
+        helper.close_logging()
 
     return stats
 

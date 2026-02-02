@@ -35,9 +35,26 @@ def train_npc(task_name, episodes=300, batch_size=64,
     
     # Modifiche specifiche per task
     if task_type == "Crossing":
-        agent.epsilon_decay = 0.998  # Decay più veloce
-        agent.epsilon_min = 0.05     # Minimo più basso
+        # Crossing: Prudenza massima, decay lento
+        agent.epsilon_decay = 0.998  
+        agent.epsilon_min = 0.05
         print(f"Crossing mode: epsilon_decay={agent.epsilon_decay}, epsilon_min={agent.epsilon_min}")
+    
+    elif task_type == "Empty":
+        agent.epsilon_decay = 0.9995 
+        agent.epsilon_min = 0.05
+        print(f"Empty mode: epsilon_decay={agent.epsilon_decay}, epsilon_min={agent.epsilon_min}")
+        
+    else:
+        if "16x16" in env_gym.spec.id:
+            agent.epsilon_decay = 0.99995
+            agent.epsilon_min = 0.05
+            print(f"DoorKey mode: epsilon_decay={agent.epsilon_decay}, epsilon_min={agent.epsilon_min}")
+        else:
+            # DoorKey e altri
+            agent.epsilon_decay = 0.995
+            agent.epsilon_min = 0.10
+            print(f"DoorKey mode: epsilon_decay={agent.epsilon_decay}, epsilon_min={agent.epsilon_min}")
 
     #Se esiste un CSV
     if csv_out:

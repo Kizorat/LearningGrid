@@ -4,15 +4,14 @@ import torch.nn as nn
 import torch.optim as optim
 from collections import deque
 import random
-import heapq
 
-# rete neurale con Dueling Architecture
+# Rete neurale con Dueling Architecture
 class DQN(nn.Module):
     def __init__(self, state_size, action_size, dueling=False):
         super(DQN, self).__init__()
         self.dueling = dueling
         
-        # Layers condivisi
+        # Layers condivisi (più neuroni per gestire mappe complesse)
         self.fc1 = nn.Linear(state_size, 256)
         self.fc2 = nn.Linear(256, 256)
         
@@ -59,42 +58,50 @@ class DQNAgent:
             self.priorities = deque(maxlen=replay_buffer_size)
 
         # Hyperparameters 
-        self.gamma = 0.99  # Fattore di sconto
-        self.epsilon = 1.0 # Inizialmente molta esplorazione
-        self.epsilon_min = 0.10  # Minimo più alto per mappe grandi
-        self.epsilon_decay = 0.9999  # Decay più lento
-        self.learning_rate = 0.0003  # Learning rate più basso
-        self.target_update_freq = 100  # Aggiorna target ogni N step
-        self.tau = 0.005  # Soft update factor per target network
-        self.step_count = 0 # Conta gli step per aggiornare il target network
+        self.gamma = 0.99  # Fattore di sconto base (verrà modificato esternamente per le 16x16)
+        self.epsilon = 1.0 
+        self.epsilon_min = 0.05 
+        self.epsilon_decay = 0.9995 
+        self.learning_rate = 0.00025 
+        self.target_update_freq = 1000 
+        self.tau = 0.005 # Soft update
+        self.step_count = 0 
         
-        # Double DQN
         self.use_double_dqn = True
 
         # Device
         self.device = torch.device(device) if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"DQNAgent running on {self.device}")
 
-        # Models con Dueling architecture
+        # Models
         self.model = DQN(state_size, action_size, dueling=dueling).to(self.device)
         self.target_model = DQN(state_size, action_size, dueling=dueling).to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
-        self.criterion = nn.HuberLoss()  # Huber loss, più stabile delle MSE
+        
+        # --- OTTIMIZZATORE ADAMW ---
+        # Weight Decay: Previene overfitting su traiettorie specifiche
+        # Amsgrad: Migliora la convergenza in ambienti stocastici
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=self.learning_rate, weight_decay=1e-4, amsgrad=True)
+        
+        # Huber Loss è più robusta agli outlier rispetto a MSE
+        self.criterion = nn.HuberLoss() 
 
-        # Initialize target model
-        self.update_target_model()
+        self.update_target_model(hard=True) # Primo sync hard
 
-    # Aggiorna il target model con soft update
-    def update_target_model(self):
-        """ Target model con soft update """
-        for target_param, local_param in zip(self.target_model.parameters(), self.model.parameters()):
-            target_param.data.copy_(self.tau * local_param.data + (1.0 - self.tau) * target_param.data)
+    def update_target_model(self, hard=False):
+        if hard:
+            self.target_model.load_state_dict(self.model.state_dict())
+        else:
+            # Soft update
+            for target_param, local_param in zip(self.target_model.parameters(), self.model.parameters()):
+                target_param.data.copy_(self.tau * local_param.data + (1.0 - self.tau) * target_param.data)
 
-    def remember(self, state, action, reward, next_state, done,valid_mask, next_valid_mask):
-        # Flatten stati se multidimensionali
+    def remember(self, state, action, reward, next_state, done, valid_mask, next_valid_mask):
         state = state.flatten() if len(state.shape) > 1 else state
         next_state = next_state.flatten() if len(next_state.shape) > 1 else next_state
+        
         self.replay_buffer.append((state, action, reward, next_state, done))
+        if self.prioritized:
+            self.priorities.append(max(self.priorities, default=1.0))
 
     def act(self, state, valid_actions=None):
         state = state.flatten() if len(state.shape) > 1 else state
@@ -102,12 +109,14 @@ class DQNAgent:
         # Epsilon-greedy
         if np.random.rand() <= self.epsilon:
             if valid_actions is not None:
-                return np.random.choice(valid_actions)
+                return random.choice(valid_actions)
             return random.randrange(self.action_size)
 
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        self.model.eval()
         with torch.no_grad():
             q_values = self.model(state_tensor).cpu().numpy()[0]
+        self.model.train()
 
         # Maschera azioni non valide
         if valid_actions is not None:
@@ -116,13 +125,24 @@ class DQNAgent:
             return np.argmax(masked)
         return np.argmax(q_values)
 
+    def _sample_prioritized_batch(self):
+        if len(self.priorities) == 0:
+            return random.sample(range(len(self.replay_buffer)), self.batch_size)
+        
+        probs = np.array(self.priorities)
+        probs = probs / probs.sum()
+        indices = np.random.choice(len(self.replay_buffer), self.batch_size, p=probs)
+        self._last_minibatch_indices = indices
+        return indices
+
     def replay(self, n_steps=1):
         if len(self.replay_buffer) < self.batch_size:
-            return
+            return None
 
+        total_loss = 0
+        
         for _ in range(n_steps):
             if self.prioritized:
-                # Prioritized Experience Replay
                 minibatch_indices = self._sample_prioritized_batch()
                 minibatch = [self.replay_buffer[i] for i in minibatch_indices]
             else:
@@ -137,7 +157,7 @@ class DQNAgent:
             # Q-values correnti
             current_q = self.model(states).gather(1, actions.unsqueeze(1)).squeeze(1)
 
-            # Double DQN: azioni dal model principale, valutate dal target
+            # Double DQN
             with torch.no_grad():
                 if self.use_double_dqn:
                     next_actions = self.model(next_states).argmax(1)
@@ -147,14 +167,16 @@ class DQNAgent:
                 
                 target_q = rewards + (1 - dones) * self.gamma * next_q
 
-            # Loss e backpropagation
+            # Loss e ottimizzazione
             loss = self.criterion(current_q, target_q)
             self.optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0) # Clipping gradienti
             self.optimizer.step()
             
-            # Aggiorna priorità se usiamo prioritized replay
+            total_loss += loss.item()
+
+            # Update priorità
             if self.prioritized and hasattr(self, '_last_minibatch_indices'):
                 td_errors = (target_q - current_q).detach().cpu().numpy()
                 for idx, td_error in zip(self._last_minibatch_indices, td_errors):
@@ -162,27 +184,15 @@ class DQNAgent:
                         self.priorities[idx] = abs(td_error) + 1e-6
 
             self.step_count += 1
-            
-            # Aggiorna target model ogni N step
             if self.step_count % self.target_update_freq == 0:
                 self.update_target_model()
 
         # Decay epsilon
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
-    
-    def _sample_prioritized_batch(self):
-        """Campiona dal replay buffer usando le priorità."""
-        if len(self.priorities) == 0:
-            return random.sample(range(len(self.replay_buffer)), self.batch_size)
-        
-        priorities = np.array(self.priorities)
-        priorities = priorities / priorities.sum()
-        indices = np.random.choice(len(self.replay_buffer), size=self.batch_size, p=priorities)
-        self._last_minibatch_indices = indices
-        return indices
+            
+        return total_loss / n_steps
 
-    # Salva il modello su file
     def save(self, filename):
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
@@ -191,7 +201,7 @@ class DQNAgent:
             'epsilon': self.epsilon
         }
         torch.save(checkpoint, filename)
-        print(f"Modello salvato: {filename}")
+        # print(f"Modello salvato: {filename}")
 
     def load(self, filename):
         checkpoint = torch.load(filename, map_location=self.device)

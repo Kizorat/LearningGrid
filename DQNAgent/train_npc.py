@@ -1,8 +1,12 @@
 import argparse
 import gymnasium as gym
 from minigrid.wrappers import FullyObsWrapper
-from enviroment import DynamicMiniGridWrapper
-from agent import DQNAgent
+try:
+    from DQNAgent.enviroment import DynamicMiniGridWrapper
+    from DQNAgent.agent import DQNAgent
+except ImportError:
+    from enviroment import DynamicMiniGridWrapper
+    from agent import DQNAgent
 import csv
 import time
 

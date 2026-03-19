@@ -10,9 +10,14 @@ import random
 from torch.optim.lr_scheduler import ReduceLROnPlateau 
 
 # Importiamo le classi esistenti
-from agent import DQNAgent
-from enviroment import DynamicMiniGridWrapper
-from train_npc import make_env, detect_task_type
+try:
+    from DQNAgent.agent import DQNAgent
+    from DQNAgent.enviroment import DynamicMiniGridWrapper
+    from DQNAgent.train_npc import make_env, detect_task_type
+except ImportError:
+    from agent import DQNAgent
+    from enviroment import DynamicMiniGridWrapper
+    from train_npc import make_env, detect_task_type
 
 # Variabile globale per gestire lo sblocco dai timeout
 timeout_streak = 0
@@ -513,6 +518,70 @@ def generate_plots(stats, output_dir="."):
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "universal_mixed_phase.png"), dpi=150)
     plt.close()
+        
+    # --- GRAFICO SEPARATO: Heatmap Statistiche Environment nella Fase Mixed ---
+    fig, ax = plt.subplots(figsize=(12, max(6, len(mixed_df['env_id'].unique()) * 0.35)))
+    mixed_df = df[df['phase'] == 'Mixed']
+
+    if len(mixed_df) > 0:
+        env_stats = mixed_df.groupby('env_id').agg(
+            num_episodes=('env_id', 'count'),
+            success_rate=('success', 'mean')
+        ).reset_index()
+
+        env_stats['success_rate'] = env_stats['success_rate'] * 100
+
+        # Ordina per numero episodi (più allenati sopra)
+        env_stats = env_stats.sort_values('num_episodes', ascending=False)
+
+        # Labels più corti
+        def shorten_env(env):
+            if 'Empty' in env:
+                return env.replace("MiniGrid-", "")
+            elif 'Crossing' in env or 'Lava' in env:
+                return env.replace("MiniGrid-", "")
+            elif 'DoorKey' in env:
+                return env.replace("MiniGrid-", "")
+            return env
+
+        env_stats['env_short'] = env_stats['env_id'].apply(shorten_env)
+
+        # Matrice Nx2
+        heatmap_data = env_stats[['num_episodes', 'success_rate']].values
+
+        # Heatmap
+        im = ax.imshow(heatmap_data, aspect="auto", cmap="Reds")
+
+        # Assi
+        ax.set_yticks(range(len(env_stats)))
+        ax.set_yticklabels(env_stats['env_short'], fontsize=9)
+
+        ax.set_xticks([0, 1])
+        ax.set_xticklabels(["Episodes", "Success %"], fontsize=11, fontweight="bold")
+
+        ax.set_title("Mixed Phase - Episodes & Success Rate per Environment", fontsize=14, fontweight="bold")
+
+        # Annotazioni nelle celle
+        for i in range(len(env_stats)):
+            ax.text(0, i, f"{int(env_stats.iloc[i]['num_episodes'])}",
+                    ha="center", va="center", fontsize=10, fontweight="bold", color="black")
+
+            ax.text(1, i, f"{env_stats.iloc[i]['success_rate']:.1f}%",
+                    ha="center", va="center", fontsize=10, fontweight="bold", color="black")
+
+        # Colorbar
+        cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("Value intensity (Episodes / Success)", fontsize=10)
+
+        # Linee separatrici per leggibilità
+        ax.set_xticks(np.arange(-.5, 2, 1), minor=True)
+        ax.set_yticks(np.arange(-.5, len(env_stats), 1), minor=True)
+        ax.grid(which="minor", color="white", linestyle='-', linewidth=2)
+        ax.tick_params(which="minor", bottom=False, left=False)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "universal_mixed_environment_stats.png"), dpi=150)
+    plt.close()
     
     print(f"\nGrafici generati in {output_dir}:")
     print("  - training_stats_universal.csv")
@@ -522,6 +591,7 @@ def generate_plots(stats, output_dir="."):
     print("  - universal_steps_by_task.png (Steps medi per task)")
     print("  - universal_curriculum_by_task.png (Reward curriculum colorato per task)")
     print("  - universal_mixed_phase.png (Reward fase mixed)")
+    print("  - universal_mixed_environment_stats.png (Episodi e Success per environment nella fase Mixed)")
 
 if __name__ == "__main__":
     run_training_suite()

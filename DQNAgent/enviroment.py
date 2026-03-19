@@ -380,6 +380,101 @@ class DynamicMiniGridWrapper:
                         heappush(open_set, (f_new, g_new, (nx, ny), path))
         return []
     
+    def _compute_astar_distance_to_target(self, target, avoid_lava=False):
+        """Calcola la distanza A* (lunghezza path) verso un target.
+        
+        Args:
+            target: Tupla (x, y) del target
+            avoid_lava: Se True, evita celle lava (per Crossing)
+        
+        Returns:
+            Lunghezza del path A* (numero di passi), o float('inf') se non raggiungibile
+        """
+        from heapq import heappush, heappop
+        
+        start = tuple(self.base_env.agent_pos)
+        if start == target:
+            return 0
+            
+        grid = self.base_env.grid
+        
+        def cell_cost(x, y):
+            cell = grid.get(x, y)
+            if cell is None:
+                return 1
+            cell_type = getattr(cell, 'type', None)
+            if cell_type == "wall":
+                return float('inf')
+            if avoid_lava and cell_type == "lava":
+                return float('inf')
+            # Per DoorKey: porte chiuse sono attraversabili solo se abbiamo la chiave
+            if cell_type == "door":
+                if self.door_open:
+                    return 1  # Porta aperta
+                else:
+                    # Porta chiusa: considerala raggiungibile ma non attraversabile
+                    return float('inf')
+            return 1
+        
+        open_set = []
+        heappush(open_set, (abs(start[0]-target[0]) + abs(start[1]-target[1]), 0, start))
+        visited = set()
+        dist = {start: 0}
+        
+        while open_set:
+            f, g, current = heappop(open_set)
+            if current in visited:
+                continue
+            visited.add(current)
+            
+            if current == target:
+                return g  # Ritorna la distanza effettiva
+            
+            x, y = current
+            for dx, dy in [(0, 1), (1, 0), (0, -1), (-1, 0)]:
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < grid.width and 0 <= ny < grid.height and (nx, ny) not in visited:
+                    cost = cell_cost(nx, ny)
+                    if cost < float('inf'):
+                        g_new = g + cost
+                        if (nx, ny) not in dist or g_new < dist[(nx, ny)]:
+                            dist[(nx, ny)] = g_new
+                            f_new = g_new + abs(nx - target[0]) + abs(ny - target[1])
+                            heappush(open_set, (f_new, g_new, (nx, ny)))
+        
+        return float('inf')  # Target non raggiungibile
+    
+    def _get_current_subgoal_astar_distance(self):
+        """Calcola la distanza A* verso il subgoal corrente per DoorKey.
+        
+        Fase 1: distanza A* verso la chiave
+        Fase 2: distanza A* verso la porta
+        Fase 3: distanza A* verso il goal
+        
+        Returns:
+            Distanza A* verso il subgoal corrente, o None se non calcolabile
+        """
+        if self.task_type != "DoorKey":
+            return None
+        
+        # Fase 1: vai verso la chiave
+        if not self.phase_1_key_reached:
+            if self.key_pos:
+                return self._compute_astar_distance_to_target(self.key_pos, avoid_lava=False)
+            return None
+        
+        # Fase 2: vai verso la porta
+        if not self.phase_2_door_opened:
+            if self.door_pos:
+                return self._compute_astar_distance_to_target(self.door_pos, avoid_lava=False)
+            return None
+        
+        # Fase 3: vai verso il goal
+        goal_pos = getattr(self.base_env, "goal_pos", None)
+        if goal_pos:
+            return self._compute_astar_distance_to_target(tuple(goal_pos), avoid_lava=False)
+        return None
+    
     def _path_step_to_action(self, current_pos, next_pos):
         """Converte step del path in azione."""
         DIR2VEC = {0: (1, 0), 1: (0, 1), 2: (-1, 0), 3: (0, -1)}
@@ -530,14 +625,33 @@ class DynamicMiniGridWrapper:
         return self.state.reshape(1, -1)
 
     def get_valid_actions(self):
-        valid = self.BASIC_ACTIONS.copy()
+        valid = self.BASIC_ACTIONS.copy()  # [0, 1] = left, right (always valid)
         front = self._get_front_cell_type()
-        valid.append(self.FORWARD)
+        
+        # FORWARD (2): only valid if not facing wall or closed door
+        if front not in ["wall"]:
+            # Check if it's a closed door (can't walk through)
+            if front == "door":
+                # Can only walk through if door is open
+                if self.door_open:
+                    valid.append(self.FORWARD)
+            else:
+                # Empty, goal, key, lava (agent can step on these)
+                valid.append(self.FORWARD)
+        
         if self.task_type == "DoorKey":
-            if front == "key":
+            # Check if agent is carrying the key
+            carrying = getattr(self.base_env, "carrying", None)
+            has_key = carrying is not None and getattr(carrying, "type", None) == "key"
+            
+            # PICKUP (3): only valid if key is in front AND agent doesn't have it yet
+            if not has_key and not self.phase_1_key_reached:
                 valid.append(self.PICKUP)
-            if front == "door" and not self.door_open:
+            
+            # TOGGLE (5): only valid if door is in front AND agent HAS the key AND door is closed
+            if has_key and not self.door_open:
                 valid.append(self.TOGGLE)
+        
         return valid
 
     def reset(self):
@@ -608,7 +722,24 @@ class DynamicMiniGridWrapper:
                 delattr(self, '_prev_dist_to_goal_phase3')
             self._detect_key_and_door_positions()
         
-        self.prev_dist_to_goal = self._compute_distance_to_goal()
+        # Precalcolo A* path per l'episodio (prima di inizializzare prev_dist_to_goal)
+        if self.task_type == "Crossing":
+            self.astar_replans_used = 0
+            self.episode_astar_cell_path = self._compute_astar_cell_path()
+            # Per Crossing: inizializza prev_dist_to_goal con distanza A*
+            goal_pos = getattr(self.base_env, "goal_pos", None)
+            if goal_pos:
+                astar_dist = self._compute_astar_distance_to_target(tuple(goal_pos), avoid_lava=True)
+                if astar_dist < float('inf'):
+                    self.prev_dist_to_goal = astar_dist
+                else:
+                    self.prev_dist_to_goal = self._compute_distance_to_goal()
+            else:
+                self.prev_dist_to_goal = self._compute_distance_to_goal()
+        else:
+            self.episode_astar_cell_path = None
+            self.prev_dist_to_goal = self._compute_distance_to_goal()
+        
         self.prev_agent_pos = getattr(self.base_env, "agent_pos", None)
         
         # Reset contatori
@@ -622,13 +753,6 @@ class DynamicMiniGridWrapper:
         
         # Reset tracking reward episodio
         self.episode_reward_sum = 0.0
-        
-        # Precalcolo A* path per l'episodio
-        if self.task_type == "Crossing":
-            self.astar_replans_used = 0
-            self.episode_astar_cell_path = self._compute_astar_cell_path()
-        else:
-            self.episode_astar_cell_path = None
         
         # Reset milestone flags
         if hasattr(self, '_reached_dist_3'):
@@ -788,8 +912,11 @@ class DynamicMiniGridWrapper:
         if self.current_step >= self.max_steps and not terminated:
             print("Timeout! Episodio troppo lungo")
             info["timeout"] = True
-            # Penalità ridotte per favorire apprendimento
-            timeout_penalty = -20.0 if self.task_type == "DoorKey" else -30.0
+            # Penalità CONSISTENTE: basata su distanza dal goal per tutti i task
+            dist_to_goal = self._compute_distance_to_goal() or 10
+            # Penalità base -10, scalata in base a quanto lontano dal goal
+            timeout_penalty = -10.0 - (dist_to_goal * 0.5)
+            timeout_penalty = max(timeout_penalty, -25.0)  # Cap a -25
             return self.get_state(), timeout_penalty, True, info
 
         # Controllo frontale DOPO azione, eventuali stati speciali
@@ -842,25 +969,57 @@ class DynamicMiniGridWrapper:
             info["lava_proximity"] = lava_proximity
             info["safe_cells_nearby"] = safe_cells_nearby
 
-        # [MODIFICA TURBO] Reward shaping unificato per Empty e Crossing
-        # Questo applica la logica "Acqua/Fuoco" anche a Crossing e semplifica Empty 16x16
-        if self.task_type in ["Empty", "Crossing"]:
+        # [MODIFICA TURBO] POTENTIAL-BASED REWARD per Empty e Crossing
+        # Evita reward loops: reward = gamma * phi(s') - phi(s)
+        # dove phi(s) = -distanza (più vicino = potenziale più alto)
+        # 
+        # IMPORTANTE per Crossing: usa distanza A* (che evita lava) invece di Manhattan
+        # Questo permette all'agente di allontanarsi dal goal se necessario per aggirare la lava
+        if self.task_type == "Empty":
+            # Empty: usa distanza Manhattan semplice
             dist_to_goal = self._compute_distance_to_goal()
             
             if dist_to_goal is not None and self.prev_dist_to_goal is not None:
-                # Calcola differenza (Delta positivo = avvicinato, negativo = allontanato)
-                delta = self.prev_dist_to_goal - dist_to_goal
-                
-                if delta > 0:
-                    # FUOCHINO: Ti sei avvicinato!
-                    # +0.1 è sufficiente per guidarlo senza sopraffare gli altri reward
-                    reward += 0.1 
-                elif delta < 0:
-                    # ACQUA: Ti sei allontanato.
-                    # Penalità leggera (-0.05) per non scoraggiare troppo l'esplorazione necessaria
-                    reward -= 0.01
+                gamma_pb = 0.99
+                phi_prev = -self.prev_dist_to_goal
+                phi_curr = -dist_to_goal
+                potential_reward = gamma_pb * phi_curr - phi_prev
+                reward += potential_reward * 0.1
             
             self.prev_dist_to_goal = dist_to_goal
+            
+        elif self.task_type == "Crossing":
+            # Crossing: usa distanza A* che evita la lava
+            # Questo premia l'agente per seguire il percorso sicuro, anche se si allontana dal goal
+            goal_pos = getattr(self.base_env, "goal_pos", None)
+            if goal_pos:
+                astar_dist = self._compute_astar_distance_to_target(tuple(goal_pos), avoid_lava=True)
+                
+                # Se il path esiste, usa la distanza A*
+                if astar_dist < float('inf'):
+                    if self.prev_dist_to_goal is not None:
+                        gamma_pb = 0.99
+                        phi_prev = -self.prev_dist_to_goal
+                        phi_curr = -astar_dist
+                        potential_reward = gamma_pb * phi_curr - phi_prev
+                        reward += potential_reward * 0.1
+                        
+                        # Debug per verificare che stia usando A*
+                        if abs(potential_reward) > 0.01:
+                            info["astar_distance_used"] = True
+                    
+                    self.prev_dist_to_goal = astar_dist
+                else:
+                    # Fallback a distanza Manhattan se A* fallisce
+                    dist_to_goal = self._compute_distance_to_goal()
+                    if dist_to_goal is not None and self.prev_dist_to_goal is not None:
+                        gamma_pb = 0.99
+                        phi_prev = -self.prev_dist_to_goal
+                        phi_curr = -dist_to_goal
+                        potential_reward = gamma_pb * phi_curr - phi_prev
+                        reward += potential_reward * 0.1
+                    self.prev_dist_to_goal = dist_to_goal
+            
             # Reset near_goal_distance se non serve più per logiche complesse
             self.near_goal_distance = None
 
@@ -942,36 +1101,42 @@ class DynamicMiniGridWrapper:
             
             # Fase 1: raccogliere chiave
             if not self.phase_1_key_reached:
-                # Reward shaping: bonus/malus per distanza dalla chiave
+                # Reward shaping: distanza A* verso la chiave (considera muri)
                 if self.key_pos:
-                    dist_to_key = abs(agent_pos[0] - self.key_pos[0]) + abs(agent_pos[1] - self.key_pos[1])
+                    # USA DISTANZA A* invece di Manhattan per considerare i muri
+                    dist_to_key = self._compute_astar_distance_to_target(self.key_pos, avoid_lava=False)
                     
-                    # Reward continua: premia ogni step che avvicina alla chiave (RIDOTTA)
-                    if hasattr(self, '_prev_dist_to_key'):
-                        delta = self._prev_dist_to_key - dist_to_key
-                        if delta > 0:
-                            # Si avvicina alla chiave
-                            reward += 1.0 if is_large_map else 0.7
+                    # Se A* fallisce, fallback a Manhattan
+                    if dist_to_key == float('inf'):
+                        dist_to_key = abs(agent_pos[0] - self.key_pos[0]) + abs(agent_pos[1] - self.key_pos[1])
+                    
+                    # POTENTIAL-BASED: reward per avvicinamento alla chiave (usa A*)
+                    if hasattr(self, '_prev_dist_to_key') and self._prev_dist_to_key is not None:
+                        gamma_pb = 0.99
+                        phi_prev = -self._prev_dist_to_key
+                        phi_curr = -dist_to_key
+                        potential_reward = gamma_pb * phi_curr - phi_prev
+                        # Scala: 0.15 per allineare con Empty/Crossing (~0.1)
+                        reward += potential_reward * 0.15
+                        if potential_reward > 0:
                             info["approaching_key"] = True
-                        elif delta < 0:
-                            # Si allontana dalla chiave - penalità leggera
-                            reward -= 0.05
+                            info["using_astar_distance"] = True
+                        elif potential_reward < 0:
                             info["moving_away_from_key"] = True
                     self._prev_dist_to_key = dist_to_key
                     
-                    # Se adiacente alla chiave (dist=1), bonus una sola volta (RIDOTTO)
+                    # Se adiacente alla chiave (dist=1), bonus una sola volta (NORMALIZZATO)
                     if dist_to_key == 1 and not self._near_key_rewarded:
-                        reward += 3.0 if is_large_map else 2.0
+                        reward += 0.5  # Ridotto da 3.0/2.0
                         self._near_key_rewarded = True
                         info["near_key"] = True
                         print(f"Fase 1: Adiacente alla chiave!")
                     
-                    # Bonus milestone per nuova distanza minima (RIDOTTO)
+                    # Bonus milestone per nuova distanza minima (NORMALIZZATO)
                     if agent_pos not in self._phase1_rewarded_cells:
                         if hasattr(self, '_best_dist_to_key'):
                             if dist_to_key < self._best_dist_to_key:
-                                bonus = 1.0 if is_large_map else 0.6
-                                reward += bonus
+                                reward += 0.2  # Ridotto da 1.0/0.6
                                 self._phase1_rewarded_cells.add(agent_pos)
                                 self._best_dist_to_key = dist_to_key
                         else:
@@ -988,8 +1153,8 @@ class DynamicMiniGridWrapper:
                         info["forward_blocked_count"] = self._forward_blocked_count
                         # Suggerimento: davanti chiave devi fare PICKUP
                         if front_type_before == "key":
-                            # Penalità forte per non fare PICKUP quando dovresti
-                            reward -= 5.0
+                            # Penalità moderata per non fare PICKUP quando dovresti
+                            reward -= 0.3
                             info["hint_pickup"] = True
                             info["missed_pickup_opportunity"] = True
                     else:
@@ -998,57 +1163,62 @@ class DynamicMiniGridWrapper:
                 
                 # Penalità per rotazioni quando sei davanti alla chiave 
                 if front_type_before == "key" and action in [0, 1]:  # left, right
-                    reward -= 2.0
+                    reward -= 0.3  # Ridotto da 2.0
                     info["rotating_at_key"] = True
                 
                 # PICKUP chiave
                 if action == self.PICKUP:
                     if front_type_before == "key" and not self._key_pickup_rewarded:
                         print(" FASE 1: Chiave raccolta!")
-                        # Reward per raccogliere la chiave (RIDOTTA)
-                        reward += 30.0 if is_large_map else 25.0
+                        # Reward NORMALIZZATA: allineata con goal reward (~5x approaching bonus)
+                        reward += 5.0
                         self.phase_1_key_reached = True
                         self._key_pickup_rewarded = True
                         info["key_picked"] = True
                         info["phase_1_complete"] = True
                     elif front_type_before != "key":
-                        # Penalità ridotta per pickup sbagliato
-                        reward -= 0.2
+                        reward -= 0.1
                         info["pickup_fail_no_key"] = True
                     # Se già raccolta, nessun reward extra
             
             # Fase 2: aprire la porta
             elif self.phase_1_key_reached and not self.phase_2_door_opened:
-                # Reward shaping CONTINUO: bonus/malus per distanza dalla porta
+                # Reward shaping: distanza A* verso la porta (considera muri)
                 if self.door_pos:
-                    dist_to_door = abs(agent_pos[0] - self.door_pos[0]) + abs(agent_pos[1] - self.door_pos[1])
+                    # USA DISTANZA A* invece di Manhattan per considerare i muri
+                    dist_to_door = self._compute_astar_distance_to_target(self.door_pos, avoid_lava=False)
                     
-                    # Reward continua: premia ogni step che avvicina alla porta (RIDOTTA)
-                    if hasattr(self, '_prev_dist_to_door'):
-                        delta = self._prev_dist_to_door - dist_to_door
-                        if delta > 0:
-                            # Si avvicina alla porta
-                            reward += 1.0 if is_large_map else 0.7
+                    # Se A* fallisce, fallback a Manhattan
+                    if dist_to_door == float('inf'):
+                        dist_to_door = abs(agent_pos[0] - self.door_pos[0]) + abs(agent_pos[1] - self.door_pos[1])
+                    
+                    # POTENTIAL-BASED: reward per avvicinamento alla porta (usa A*)
+                    if hasattr(self, '_prev_dist_to_door') and self._prev_dist_to_door is not None:
+                        gamma_pb = 0.99
+                        phi_prev = -self._prev_dist_to_door
+                        phi_curr = -dist_to_door
+                        potential_reward = gamma_pb * phi_curr - phi_prev
+                        # Scala: 0.15 per allineare con Empty/Crossing (~0.1)
+                        reward += potential_reward * 0.15
+                        if potential_reward > 0:
                             info["approaching_door"] = True
-                        elif delta < 0:
-                            # Si allontana dalla porta - penalità leggera
-                            reward -= 0.05
+                            info["using_astar_distance"] = True
+                        elif potential_reward < 0:
                             info["moving_away_from_door"] = True
                     self._prev_dist_to_door = dist_to_door
                     
-                    # Se adiacente alla porta con chiave, bonus UNA SOLA VOLTA (RIDOTTO)
+                    # Se adiacente alla porta con chiave, bonus UNA SOLA VOLTA (NORMALIZZATO)
                     if dist_to_door == 1 and carry_type == "key" and not self._near_door_rewarded:
-                        reward += 3.0 if is_large_map else 2.0
+                        reward += 0.5  # Ridotto da 3.0/2.0
                         self._near_door_rewarded = True
                         info["near_door_with_key"] = True
                         print(f"Fase 2: Adiacente alla porta con chiave!")
                     
-                    # Bonus milestone per nuova distanza minima (RIDOTTO)
+                    # Bonus milestone per nuova distanza minima (NORMALIZZATO)
                     if agent_pos not in self._phase2_rewarded_cells:
                         if hasattr(self, '_best_dist_to_door'):
                             if dist_to_door < self._best_dist_to_door:
-                                bonus = 1.0 if is_large_map else 0.6
-                                reward += bonus
+                                reward += 0.2  # Ridotto da 1.0/0.6
                                 self._phase2_rewarded_cells.add(agent_pos)
                                 self._best_dist_to_door = dist_to_door
                         else:
@@ -1065,8 +1235,8 @@ class DynamicMiniGridWrapper:
                         info["forward_blocked_count"] = self._forward_blocked_count
                         # Suggerimento: davanti porta devi fare TOGGLE
                         if front_type_before == "door":
-                            # Penalità forte per non fare TOGGLE quando dovresti
-                            reward -= 5.0
+                            # Penalità moderata per non fare TOGGLE quando dovresti
+                            reward -= 0.3
                             info["hint_toggle"] = True
                             info["missed_toggle_opportunity"] = True
                     else:
@@ -1074,15 +1244,15 @@ class DynamicMiniGridWrapper:
                 
                 # Penalità per rotazioni quando sei davanti alla porta con chiave
                 if front_type_before == "door" and carry_type == "key" and action in [0, 1]:  # left, right
-                    reward -= 2.0
+                    reward -= 0.3  # Ridotto da 2.0
                     info["rotating_at_door"] = True
                 
                 # TOGGLE porta
                 if action == self.TOGGLE:
                     if front_type_before == "door" and carry_type == "key" and not self._door_open_rewarded:
                         print(" Fase 2: Porta aperta!")
-                        # Reward per aprire la porta (RIDOTTA)
-                        reward += 30.0 if is_large_map else 25.0
+                        # Reward NORMALIZZATA: allineata con goal reward (~5x approaching bonus)
+                        reward += 5.0
                         self.phase_2_door_opened = True
                         self.door_open = True
                         self._door_open_rewarded = True
@@ -1108,28 +1278,35 @@ class DynamicMiniGridWrapper:
             
             # Fase 3: raggiungere il goal (con reward distanza + A* path)
             elif self.phase_2_door_opened:
-                # Reward shaping CONTINUO: bonus/malus per distanza dal goal
+                # POTENTIAL-BASED reward shaping: distanza A* verso il goal (considera muri e porta)
                 goal_pos = getattr(self.base_env, "goal_pos", None)
                 if goal_pos:
-                    dist_to_goal = abs(agent_pos[0] - goal_pos[0]) + abs(agent_pos[1] - goal_pos[1])
+                    # USA DISTANZA A* invece di Manhattan per considerare il layout della mappa
+                    dist_to_goal = self._compute_astar_distance_to_target(tuple(goal_pos), avoid_lava=False)
                     
-                    # Reward continua: premia ogni step che avvicina al goal (RIDOTTA)
-                    if hasattr(self, '_prev_dist_to_goal_phase3'):
-                        delta = self._prev_dist_to_goal_phase3 - dist_to_goal
-                        if delta > 0:
-                            # Si avvicina al goal
-                            reward += 1.0 if is_large_map else 0.7
+                    # Se A* fallisce, fallback a Manhattan
+                    if dist_to_goal == float('inf'):
+                        dist_to_goal = abs(agent_pos[0] - goal_pos[0]) + abs(agent_pos[1] - goal_pos[1])
+                    
+                    # POTENTIAL-BASED: reward per avvicinamento al goal (usa A*)
+                    if hasattr(self, '_prev_dist_to_goal_phase3') and self._prev_dist_to_goal_phase3 is not None:
+                        gamma_pb = 0.99
+                        phi_prev = -self._prev_dist_to_goal_phase3
+                        phi_curr = -dist_to_goal
+                        potential_reward = gamma_pb * phi_curr - phi_prev
+                        # Scala: 0.15 per allineare con Empty/Crossing (~0.1)
+                        reward += potential_reward * 0.15
+                        if potential_reward > 0:
                             info["approaching_goal"] = True
-                        elif delta < 0:
-                            # Si allontana dal goal - penalità leggera
-                            reward -= 0.05
+                            info["using_astar_distance"] = True
+                        elif potential_reward < 0:
                             info["moving_away_from_goal"] = True
                     self._prev_dist_to_goal_phase3 = dist_to_goal
                 
-                # Reward BONUS se l'agente è su una cella del path A* (RIDOTTO)
+                # Reward BONUS se l'agente è su una cella del path A* (NORMALIZZATO)
                 if self.doorkey_astar_path and agent_pos in self.doorkey_astar_path:
                     if agent_pos not in self.astar_reward_given_cells:
-                        reward += 2.0  # Reward extra per essere sul path ottimo
+                        reward += 0.3  # Ridotto da 2.0
                         self.astar_reward_given_cells.add(agent_pos)
                         info["on_astar_path"] = True
                 

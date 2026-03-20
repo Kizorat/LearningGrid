@@ -216,3 +216,21 @@ Minigrid/*
 
 # Vscode Folder
 .vscode/*
+
+# Plots Folder
+Plots/*
+
+# Model Reviewer Folder
+ReviewerPPO/Model/
+ReviewerPPO/Plots/
+
+# Saved Generations
+2026-*/
+
+# Reviwer Dataset Offline
+reviewer_dataset_offline.csv
+
+# DQN Model folder
+CurriculumAgent
+
+__init__.py

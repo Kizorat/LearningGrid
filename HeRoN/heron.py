@@ -604,6 +604,16 @@ def train_heron(
     print(f"HeRoN | curriculum={len(map_schedule)} envs | total_eps={total_episodes} | "
           f"strategy={strategy_name} | device={DEVICE}")
 
+    layout_manager = None
+    LayoutManagerClass = None
+    if render:
+        try:
+            from UI.visual_game import LayoutManager as _LayoutManager
+            LayoutManagerClass = _LayoutManager
+        except Exception as e:
+            print(f"Render UI disabled: could not load LayoutManager ({e})")
+            render = False
+
     plots_dir = PLOTS_DIR / DATESTAMP
     results_dir = RESULTS_DIR / DATESTAMP
     model_dir = results_dir / "checkpoints"
@@ -675,6 +685,9 @@ def train_heron(
 
     prev_env_id = None
 
+    if render and LayoutManagerClass is not None and map_schedule:
+        layout_manager = LayoutManagerClass(map_schedule[0]["id"])
+
     for sched_idx, entry in enumerate(map_schedule):
         env_id = entry["id"]
         n_episodes = entry["episodes"]
@@ -711,9 +724,12 @@ def train_heron(
         )
 
         # Environment + helper
-        env_gym = make_env(env_id, render=render)
+        env_gym = make_env(env_id, render=False)
         env = DynamicMiniGridWrapper(env_gym, task_type)
         env.env_id = env_id
+
+        if render and layout_manager is not None:
+            layout_manager.set_env(env_id)
 
         llm_helper.env_type = task_type
         action_queue = deque()
@@ -733,6 +749,9 @@ def train_heron(
             episode_hallucinations = 0
             step_counter = 0
             max_moves = 500
+            last_helper_actions = []
+            last_reviewer_feedback = ""
+            last_revised_actions = []
 
             strategy.reset_episode()
             action_queue.clear()
@@ -763,13 +782,17 @@ def train_heron(
                                     grid, agent_pos, agent_dir, goal_pos, max_actions=5
                                 )
 
+                            last_helper_actions = list(helper_actions)
+
                             if hallucination_flag:
                                 episode_hallucinations += 1
 
                             feedback = reviewer.generate_feedback(env, helper_actions) if helper_actions else ""
+                            last_reviewer_feedback = feedback
                             revised_actions = _ask_llm_revised(
                                 env, helper_actions, feedback, model_name, task_type, verbose
                             )
+                            last_revised_actions = list(revised_actions)
 
                             suggested_ids = [
                                 _ACTION_NAME_TO_ID[a.lower()]
@@ -816,6 +839,38 @@ def train_heron(
                 step_counter += 1
 
                 strategy.update()
+
+                if render and layout_manager is not None:
+                    frame = None
+                    try:
+                        base_env = env.env.unwrapped
+                        if hasattr(base_env, 'get_frame'):
+                            frame = base_env.get_frame(highlight=True, tile_size=32)
+                    except Exception:
+                        frame = None
+
+                    status_lines = [
+                        f"Env: {env_id}",
+                        f"Task: {task_type.capitalize()}",
+                        f"Episode: {local_ep + 1}/{n_episodes}",
+                        f"Step: {moves}/{max_moves}",
+                        f"Reward: {total_reward:.2f}",
+                        f"Epsilon: {agent.epsilon:.3f}",
+                        f"Helper calls: {helper_calls}",
+                    ]
+
+                    if last_helper_actions:
+                        status_lines.append(f"Helper: {last_helper_actions}")
+                    if last_reviewer_feedback:
+                        status_lines.append(
+                            f"Reviewer: {last_reviewer_feedback.replace(chr(10), ' | ')[:220]}"
+                        )
+                    if last_revised_actions:
+                        status_lines.append(f"Revised: {last_revised_actions}")
+
+                    layout_manager.update_text(status_lines, episode_num=global_ep + 1)
+                    if not layout_manager.render(frame):
+                        render = False
 
                 train_freq = 8 if task_type.lower() == 'doorkey' else 4
                 if step_counter % train_freq == 0 and len(agent.replay_buffer) > batch_size:
@@ -948,6 +1003,8 @@ def train_heron(
         episode_deaths=episode_deaths,
     )
     llm_helper.close_logging()
+    if layout_manager is not None:
+        layout_manager.close()
     print(f"Results saved to {results_dir} | Plots saved to {plots_dir}")
     return metrics
 

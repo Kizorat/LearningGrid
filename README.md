@@ -1,4 +1,4 @@
-![LearningGrid Introduction](images/MiniGrid.gif)
+![LearningGrid Introduction](images/Minigrid.gif)
 
 # LearningGrid
 
